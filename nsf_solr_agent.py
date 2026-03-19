@@ -203,25 +203,89 @@ def _fetch_award_rows(award_ids: list[str]) -> dict[str, dict]:
     return {r["award_id"]: dict(r) for r in rows}
 
 
+# Status value map — model picks a key, we supply the exact SOLR string
+_STATUS_MAP = {
+    "awarded":  ('status:("Proposal has been awarded" OR '
+                 '"Pending, PM recommends award" OR '
+                 '"Recommended for award, DDConcurred")'),
+    "declined": 'status:("Decline, DDConcurred" OR "Pending, PM recommends decline")',
+    "pending":  'status:("Pending, Review Package Produced" OR "Pending, Assigned to PM")',
+}
+
+_FACET_FIELDS = {
+    "directorate", "division", "inst", "inst_state", "status",
+    "received_year", "funding_program", "panel_id", "panel_name",
+    "pi_gender", "pi_race", "pi_ethnicity",
+}
+
+
+def _build_query(keywords: str = "", directorate: str = "", year: int = 0,
+                 status: str = "", pi_name: str = "", panel_id: str = "",
+                 inst: str = "", extra: str = "") -> str:
+    """Build a Lucene query string from structured parameters."""
+    clauses = []
+    if keywords:
+        clauses.append(f"summary:({keywords})")
+    if directorate:
+        clauses.append(f"directorate:{directorate.upper()}")
+    if year:
+        clauses.append(f"received_year:{int(year)}")
+    if status:
+        key = status.lower()
+        if key in _STATUS_MAP:
+            clauses.append(_STATUS_MAP[key])
+        else:
+            clauses.append(f'status:"{status}"')
+    if pi_name:
+        clauses.append(f'pi_name:"{pi_name}"')
+    if panel_id:
+        clauses.append(f"panel_id:{panel_id}")
+    if inst:
+        clauses.append(f'inst:"{inst}"')
+    if extra:
+        clauses.append(extra)
+    return " AND ".join(clauses) if clauses else "*:*"
+
+
+def _fmt_docs(results, fields: str) -> str:
+    lines = [f"Found {results.hits:,} proposals (showing {len(list(results))}):\n"]
+    for doc in results:
+        lines.append(f"ID: {doc.get('id','?')}  |  {doc.get('title','(no title)')}")
+        for f in fields.split(","):
+            f = f.strip()
+            if f not in ("id", "title") and f in doc:
+                val = str(doc[f])
+                lines.append(f"  {f}: {val[:400] + '…' if len(val) > 400 else val}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-def search_proposals(query: str, fields: str = "id,title,summary", rows: int = 5) -> str:
+def search_proposals(keywords: str = "", directorate: str = "", year: int = 0,
+                     status: str = "", pi_name: str = "", panel_id: str = "",
+                     inst: str = "", extra_query: str = "",
+                     fields: str = "id,title,summary", rows: int = 10) -> str:
+    """Search NSF proposals with structured filters.
+    keywords:    words to find in the summary (e.g. 'quantum computing')
+    directorate: BIO | CSE | ENG | GEO | MPS | SBE | EDU | TIP
+    year:        received_year e.g. 2024
+    status:      awarded | declined | pending
+    pi_name:     PI full name (exact match)
+    panel_id:    panel ID e.g. P260135
+    inst:        institution name
+    extra_query: raw Lucene clause appended with AND (escape hatch)
+    fields:      comma-separated fields to return
+    rows:        number of results (max 50)
+    """
+    query = _build_query(keywords, directorate, year, status, pi_name, panel_id, inst, extra_query)
     try:
         results = _solr().search(query, **{"fl": fields, "rows": min(int(rows), 50)})
         if not results.hits:
-            return f"No results for: {query}"
-        lines = [f"Found {results.hits:,} proposals (showing {len(list(results))}):\n"]
-        for doc in results:
-            lines.append(f"ID: {doc.get('id','?')}  |  {doc.get('title','(no title)')}")
-            for f in fields.split(","):
-                f = f.strip()
-                if f not in ("id", "title") and f in doc:
-                    val = str(doc[f])
-                    lines.append(f"  {f}: {val[:400] + '…' if len(val) > 400 else val}")
-            lines.append("")
-        return "\n".join(lines)
+            return f"No results for query: {query}"
+        return _fmt_docs(results, fields)
     except Exception as e:
         return f"SOLR error (check VPN): {e}"
 
@@ -273,21 +337,38 @@ def fetch_proposals_by_ids(id_list: str,
         return f"SOLR error (check VPN): {e}"
 
 
-def facet_proposals(query: str, facet_field: str, limit: int = 15) -> str:
+def facet_proposals(facet_by: str, keywords: str = "", directorate: str = "",
+                    year: int = 0, status: str = "", panel_id: str = "",
+                    limit: int = 20) -> str:
+    """Count top values for a field across matching proposals.
+    facet_by:    what to count — directorate | division | inst | inst_state |
+                 status | received_year | funding_program | panel_id |
+                 pi_gender | pi_race | pi_ethnicity
+    keywords:    optional keyword filter on summary
+    directorate: optional directorate filter (BIO | CSE | ENG | ...)
+    year:        optional year filter
+    status:      optional awarded | declined | pending filter
+    panel_id:    optional panel filter
+    limit:       number of top values to show
+    """
+    if facet_by not in _FACET_FIELDS:
+        return (f"Unknown facet field '{facet_by}'. "
+                f"Valid: {', '.join(sorted(_FACET_FIELDS))}")
+    query = _build_query(keywords, directorate, year, status, panel_id=panel_id)
     try:
         results = _solr().search(query, **{
             "rows": 0,
             "facet": "true",
-            "facet.field": facet_field,
+            "facet.field": facet_by,
             "facet.limit": int(limit),
             "facet.mincount": 1,
         })
-        raw   = results.facets.get("facet_fields", {}).get(facet_field, [])
+        raw   = results.facets.get("facet_fields", {}).get(facet_by, [])
         pairs = list(zip(raw[::2], raw[1::2]))
         if not pairs:
-            return f"No facet data for '{facet_field}' (matched {results.hits:,} proposals)"
+            return f"No facet data for '{facet_by}' (query matched {results.hits:,} proposals)"
         max_c = pairs[0][1]
-        lines = [f"Top {len(pairs)} values for '{facet_field}' across {results.hits:,} proposals:\n"]
+        lines = [f"Top {len(pairs)} values for '{facet_by}' across {results.hits:,} proposals:\n"]
         for val, count in pairs:
             bar = "█" * int(count / max(max_c, 1) * 25)
             lines.append(f"  {str(val):<40} {count:>7,}  {bar}")
@@ -715,15 +796,21 @@ OLLAMA_TOOLS = [
         "type": "function",
         "function": {
             "name": "search_proposals",
-            "description": "Search NSF proposals using Lucene query syntax.",
+            "description": "Search NSF proposals using structured filters. Pass only the filters you need — all are optional.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query":  {"type": "string",  "description": "Lucene query, e.g. 'pi_name:\"Jane Smith\"' or 'summary:(quantum computing)'"},
-                    "fields": {"type": "string",  "description": "comma-separated fields: id,title,summary,description,pi_name,inst,award_amount,directorate,received_year,status"},
-                    "rows":   {"type": "integer", "description": "number of results (max 50)"},
+                    "keywords":     {"type": "string",  "description": "words to find in proposal summary e.g. 'quantum computing'"},
+                    "directorate":  {"type": "string",  "description": "one of: BIO, CSE, ENG, GEO, MPS, SBE, EDU, TIP"},
+                    "year":         {"type": "integer", "description": "received_year e.g. 2024"},
+                    "status":       {"type": "string",  "description": "one of: awarded, declined, pending"},
+                    "pi_name":      {"type": "string",  "description": "PI full name for exact match e.g. 'Jane Smith'"},
+                    "panel_id":     {"type": "string",  "description": "panel ID e.g. P260135"},
+                    "inst":         {"type": "string",  "description": "institution name e.g. 'University of Michigan'"},
+                    "extra_query":  {"type": "string",  "description": "raw Lucene clause appended with AND, for advanced use only"},
+                    "fields":       {"type": "string",  "description": "comma-separated fields to return (default: id,title,summary)"},
+                    "rows":         {"type": "integer", "description": "number of results, max 50 (default: 10)"},
                 },
-                "required": ["query"],
             },
         },
     },
@@ -761,15 +848,19 @@ OLLAMA_TOOLS = [
         "type": "function",
         "function": {
             "name": "facet_proposals",
-            "description": "Count top values for a field across matching proposals.",
+            "description": "Count top values for a field across matching proposals (breakdown/distribution). All filters optional.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query":       {"type": "string",  "description": "Lucene query selecting proposals to count"},
-                    "facet_field": {"type": "string",  "description": "field to break down: directorate, division, inst, inst_state, status, received_year, funding_program"},
-                    "limit":       {"type": "integer", "description": "number of top values to show"},
+                    "facet_by":    {"type": "string",  "description": "field to count — one of: directorate, division, inst, inst_state, status, received_year, funding_program, panel_id, pi_gender, pi_race, pi_ethnicity"},
+                    "keywords":    {"type": "string",  "description": "optional keyword filter on summary"},
+                    "directorate": {"type": "string",  "description": "optional: BIO, CSE, ENG, GEO, MPS, SBE, EDU, TIP"},
+                    "year":        {"type": "integer", "description": "optional received_year filter"},
+                    "status":      {"type": "string",  "description": "optional: awarded, declined, pending"},
+                    "panel_id":    {"type": "string",  "description": "optional panel ID filter"},
+                    "limit":       {"type": "integer", "description": "number of top values (default 20)"},
                 },
-                "required": ["query", "facet_field"],
+                "required": ["facet_by"],
             },
         },
     },
@@ -908,34 +999,12 @@ Use SOLR tools for: proposal full text, declined proposals, panel analysis, revi
 Use SQLite tools for: semantic/concept search, SQL aggregations, PI career profiles, funding trends.
 Two-step pattern: semantic_search or hybrid_search to find award IDs → get_proposal for full SOLR text.
 
-═══ SOLR FIELDS (exact spelling — do not alter field names) ═══
-  id, title, summary, description, pi_name, pi_all, inst, inst_state
-  award_amount, directorate, division, received_year
-  panel_id, panel_name, panel_reviewers
-  pi_gender, pi_race, pi_ethnicity, reviewer_name, reviewer_gender
+SOLR search_proposals and facet_proposals use STRUCTURED PARAMETERS — do not write Lucene queries.
+Pass filters as separate arguments: directorate="BIO", year=2024, status="awarded", panel_id="P260135".
+Valid directorate values: BIO, CSE, ENG, GEO, MPS, SBE, EDU, TIP
+Valid status values: awarded, declined, pending
 
-FIELD NAME SPELLINGS — use exactly as written, no variations:
-  directorate   (NOT directorato, NOT Directorate, NOT dir)
-  received_year (NOT year, NOT receivedyear)
-  panel_id      (NOT panelid, NOT panel)
-  award_amount  (NOT amount, NOT awardAmount)
-
-STATUS (exact strings, always quoted):
-  status:"Proposal has been awarded"
-  status:"Pending, PM recommends award"
-  status:"Recommended for award, DDConcurred"
-  status:"Decline, DDConcurred"
-  status:"Pending, PM recommends decline"
-  status:"Pending, Review Package Produced"
-  NEVER use status:Awarded — returns nothing.
-
-═══ SOLR QUERY EXAMPLES ═══
-  panel_id:P260135 AND status:"Proposal has been awarded"
-  directorate:BIO AND received_year:2024
-  pi_name:"Jane Smith"
-  summary:(quantum computing)
-
-═══ SQLITE SQL EXAMPLES ═══
+SQLITE SQL EXAMPLES:
   -- funding by directorate 2023
   SELECT d.abbreviation, COUNT(*) n, SUM(a.award_amount)/1e6 total_m
   FROM award a JOIN directorate d ON d.id=a.directorate_id
