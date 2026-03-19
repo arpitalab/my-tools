@@ -9,8 +9,8 @@ Default: ollama native tool-calling (llama3.1, llama3.2, qwen2.5).
 Fallback: --react flag for models without tool support (phi4).
 
 Usage:
-    python nsf_solr_agent.py                               # llama3.2, output/ in same dir
-    python nsf_solr_agent.py --model llama3.1              # larger context window
+    python nsf_solr_agent.py                               # llama3.1 (default)
+    python nsf_solr_agent.py --model llama3.2              # smaller/faster
     python nsf_solr_agent.py --model phi4 --react          # ReAct fallback
     python nsf_solr_agent.py --out panel_report.md         # save session to file
     python nsf_solr_agent.py --output /path/to/output      # custom index directory
@@ -908,11 +908,17 @@ Use SOLR tools for: proposal full text, declined proposals, panel analysis, revi
 Use SQLite tools for: semantic/concept search, SQL aggregations, PI career profiles, funding trends.
 Two-step pattern: semantic_search or hybrid_search to find award IDs → get_proposal for full SOLR text.
 
-═══ SOLR FIELDS ═══
+═══ SOLR FIELDS (exact spelling — do not alter field names) ═══
   id, title, summary, description, pi_name, pi_all, inst, inst_state
   award_amount, directorate, division, received_year
   panel_id, panel_name, panel_reviewers
   pi_gender, pi_race, pi_ethnicity, reviewer_name, reviewer_gender
+
+FIELD NAME SPELLINGS — use exactly as written, no variations:
+  directorate   (NOT directorato, NOT Directorate, NOT dir)
+  received_year (NOT year, NOT receivedyear)
+  panel_id      (NOT panelid, NOT panel)
+  award_amount  (NOT amount, NOT awardAmount)
 
 STATUS (exact strings, always quoted):
   status:"Proposal has been awarded"
@@ -1114,7 +1120,7 @@ def run_react(model: str, verbose: bool) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def run_repl(model: str = "llama3.2", verbose: bool = False,
+def run_repl(model: str = "llama3.1", verbose: bool = False,
              react: bool = False, out: str | None = None) -> None:
     if not verbose:
         sys.stderr = open(os.devnull, "w")
@@ -1142,8 +1148,8 @@ def run_repl(model: str = "llama3.2", verbose: bool = False,
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="NSF SOLR + SQLite agent (Ollama)")
-    p.add_argument("--model",   default="llama3.2",
-                   help="Ollama model (default: llama3.2). Use llama3.1 for larger context.")
+    p.add_argument("--model",   default="llama3.1",
+                   help="Ollama model (default: llama3.1).")
     p.add_argument("--verbose", action="store_true",
                    help="Show tool calls and results")
     p.add_argument("--react",   action="store_true",
