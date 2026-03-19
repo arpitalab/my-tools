@@ -990,19 +990,31 @@ OLLAMA_TOOLS = [
 
 SYSTEM_MSG = {
     "role": "system",
-    "content": """You are an expert assistant for NSF research data with two data sources:
+    "content": """You are a database query assistant for NSF research proposals.
 
-1. SOLR (VPN required) — all proposals including declined/pending, full text, panel/reviewer data
-2. SQLite (local, no VPN) — 162k awarded grants 2010-2024, semantic search, PI profiles
+CRITICAL RULES — violation means your answer is wrong:
+1. NEVER state a PI name, proposal title, institution, or any proposal detail from memory.
+2. ALWAYS call a tool first. Every factual answer must come from a tool result.
+3. If you do not know which tool to use, call db_schema or proposal_fields to explore.
+4. If a tool returns no results, say so — do not substitute your own knowledge.
 
-Use SOLR tools for: proposal full text, declined proposals, panel analysis, reviewer info.
-Use SQLite tools for: semantic/concept search, SQL aggregations, PI career profiles, funding trends.
-Two-step pattern: semantic_search or hybrid_search to find award IDs → get_proposal for full SOLR text.
+DATA SOURCES:
+- SOLR (VPN required): all proposals including declined/pending, full text, panel/reviewer data
+- SQLite (local): 162k awarded grants 2010-2024, semantic search, PI profiles, SQL analytics
 
-SOLR search_proposals and facet_proposals use STRUCTURED PARAMETERS — do not write Lucene queries.
-Pass filters as separate arguments: directorate="BIO", year=2024, status="awarded", panel_id="P260135".
-Valid directorate values: BIO, CSE, ENG, GEO, MPS, SBE, EDU, TIP
-Valid status values: awarded, declined, pending
+WHEN TO USE EACH:
+- Proposal text, declines, panels, reviewers → SOLR (search_proposals, get_proposal)
+- Concept/topic discovery → SQLite semantic_search or hybrid_search
+- Funding trends, counts, aggregations → SQLite sql_query
+- PI career history → SQLite get_researcher
+
+SOLR FILTERS (pass as separate arguments, never write Lucene syntax):
+  directorate: BIO | CSE | ENG | GEO | MPS | SBE | EDU | TIP
+  status:      awarded | declined | pending
+  year:        integer e.g. 2024
+  panel_id:    e.g. P260135
+  pi_name:     exact full name e.g. "Jane Smith"
+  keywords:    words to find in summary e.g. "quantum computing"
 
 SQLITE SQL EXAMPLES:
   -- funding by directorate 2023
@@ -1065,17 +1077,32 @@ def run_native(model: str, verbose: bool, outfile=None) -> None:
         history.append({"role": "user", "content": user_input})
         messages = [SYSTEM_MSG] + history[-30:]
 
+        tool_called = False
         for _ in range(16):
             resp    = ollama.chat(model=model, messages=messages, tools=OLLAMA_TOOLS)
             msg     = resp["message"]
             calls   = msg.get("tool_calls") or []
 
             if not calls:
+                # If the model skipped tools entirely, push back once
+                if not tool_called:
+                    messages.append(msg)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You must call a tool to answer this — do not use your "
+                            "training data. Names, titles, and proposal details must "
+                            "come from the database. Please call the appropriate tool now."
+                        ),
+                    })
+                    tool_called = True   # only push back once
+                    continue
                 answer = msg.get("content", "").strip()
                 emit(f"\nAssistant: {answer}\n")
                 history.append({"role": "assistant", "content": answer})
                 break
 
+            tool_called = True
             messages.append(msg)
             for tc in calls:
                 fn_info = tc.get("function", tc)
