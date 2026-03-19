@@ -1,25 +1,24 @@
 """
-nsf_solr_agent.py — Ollama agent over the NSF SOLR database.
+nsf_solr_agent.py — Ollama ReAct agent over the NSF SOLR database.
 
-Uses a simple manual tool-calling loop — no LangChain agent framework,
-no version compatibility issues. Just langchain-ollama + pysolr.
+Uses a ReAct (Reason + Act) text loop — works with ANY Ollama model
+including phi4, llama3, mistral etc. No native tool-calling required.
 
 Usage:
     python nsf_solr_agent.py
     python nsf_solr_agent.py --model phi4 --verbose
 
 Requirements:
-    pip install langchain-ollama pysolr
+    pip install ollama pysolr
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 
+import ollama
 import pysolr
-from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
-from langchain_core.tools import tool
 
 # ---------------------------------------------------------------------------
 # Config
@@ -51,20 +50,12 @@ def _solr() -> pysolr.Solr:
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tools (plain functions — no decorator needed)
 # ---------------------------------------------------------------------------
 
-@tool
 def search_proposals(query: str, fields: str = "id,title,summary", rows: int = 5) -> str:
-    """Search NSF proposals using Lucene query syntax.
-    query: Lucene string e.g. 'pi_name:"Jane Smith"', 'summary:(quantum computing)',
-           'directorate:BIO AND received_year:[2020 TO 2024]'
-    fields: comma-separated fields — id, title, summary, description, pi_name,
-            inst, award_amount, directorate, received_year, status
-    rows: number of results (max 50)
-    """
     try:
-        results = _solr().search(query, **{"fl": fields, "rows": min(rows, 50)})
+        results = _solr().search(query, **{"fl": fields, "rows": min(int(rows), 50)})
         if not results.hits:
             return f"No results for: {query}"
         lines = [f"Found {results.hits:,} proposals (showing {len(list(results))}):\n"]
@@ -72,7 +63,7 @@ def search_proposals(query: str, fields: str = "id,title,summary", rows: int = 5
             lines.append(f"ID: {doc.get('id','?')}  |  {doc.get('title','(no title)')}")
             for f in fields.split(","):
                 f = f.strip()
-                if f not in ("id","title") and f in doc:
+                if f not in ("id", "title") and f in doc:
                     val = str(doc[f])
                     if len(val) > 400:
                         val = val[:400] + "…"
@@ -83,13 +74,8 @@ def search_proposals(query: str, fields: str = "id,title,summary", rows: int = 5
         return f"SOLR error (check VPN): {e}"
 
 
-@tool
 def get_proposal(proposal_id: str,
                  fields: str = "id,title,summary,description,pi_name,inst,award_amount,directorate,received_year,status") -> str:
-    """Retrieve a single NSF proposal by ID with full text.
-    proposal_id: NSF proposal ID e.g. '2535312'
-    fields: comma-separated fields to return
-    """
     try:
         results = _solr().search(f'id:{proposal_id}', **{"fl": fields, "rows": 1})
         docs = list(results)
@@ -106,13 +92,8 @@ def get_proposal(proposal_id: str,
         return f"SOLR error (check VPN): {e}"
 
 
-@tool
 def fetch_proposals_by_ids(id_list: str,
                            fields: str = "id,title,summary,pi_name,award_amount") -> str:
-    """Fetch multiple proposals by comma-separated IDs.
-    id_list: e.g. '2535312,2535313,2535314'
-    fields: fields to return for each proposal
-    """
     ids = [i.strip() for i in id_list.split(",") if i.strip()]
     if not ids:
         return "No IDs provided."
@@ -129,9 +110,9 @@ def fetch_proposals_by_ids(id_list: str,
             lines.append(f"ID {doc.get('id')}  |  {doc.get('title','?')}")
             for f in fields.split(","):
                 f = f.strip()
-                if f not in ("id","title") and f in doc:
+                if f not in ("id", "title") and f in doc:
                     val = str(doc[f])
-                    lines.append(f"  {f}: {val[:300] + '…' if len(val)>300 else val}")
+                    lines.append(f"  {f}: {val[:300] + '…' if len(val) > 300 else val}")
             lines.append("")
         if missing:
             lines.append(f"Not found: {', '.join(missing)}")
@@ -140,20 +121,13 @@ def fetch_proposals_by_ids(id_list: str,
         return f"SOLR error (check VPN): {e}"
 
 
-@tool
 def facet_proposals(query: str, facet_field: str, limit: int = 15) -> str:
-    """Count top values for a field across matching proposals.
-    query: Lucene query selecting which proposals to count over
-    facet_field: field to break down — directorate, division, inst,
-                 inst_state, status, received_year, funding_program
-    limit: number of top values to show
-    """
     try:
         results = _solr().search(query, **{
             "rows": 0,
             "facet": "true",
             "facet.field": facet_field,
-            "facet.limit": limit,
+            "facet.limit": int(limit),
             "facet.mincount": 1,
         })
         raw   = results.facets.get("facet_fields", {}).get(facet_field, [])
@@ -170,18 +144,14 @@ def facet_proposals(query: str, facet_field: str, limit: int = 15) -> str:
         return f"SOLR error (check VPN): {e}"
 
 
-@tool
 def proposal_fields(group: str = "") -> str:
-    """List available NSF proposal field groups, or details of one group.
-    group: optional code e.g. 'fi_pin', 'fi_awd'. Leave empty to list all.
-    """
     if group:
         if group not in FIELD_GROUPS:
             return f"Unknown group '{group}'. Valid: {', '.join(FIELD_GROUPS)}"
         return f"{group}: {FIELD_GROUPS[group]}"
     lines = ["Field groups (use field names in search/get_proposal):\n"]
-    for code, fields in FIELD_GROUPS.items():
-        lines.append(f"  {code:<8}  {fields}")
+    for code, flds in FIELD_GROUPS.items():
+        lines.append(f"  {code:<8}  {flds}")
     return "\n".join(lines)
 
 
@@ -189,30 +159,97 @@ def proposal_fields(group: str = "") -> str:
 # Tool registry
 # ---------------------------------------------------------------------------
 
-TOOLS = [search_proposals, get_proposal, fetch_proposals_by_ids,
-         facet_proposals, proposal_fields]
+TOOL_MAP = {
+    "search_proposals":      search_proposals,
+    "get_proposal":          get_proposal,
+    "fetch_proposals_by_ids": fetch_proposals_by_ids,
+    "facet_proposals":       facet_proposals,
+    "proposal_fields":       proposal_fields,
+}
 
-TOOL_MAP = {t.name: t for t in TOOLS}
+TOOL_DOCS = """
+You have access to these tools. To call a tool, output EXACTLY:
 
-SYSTEM = SystemMessage(content="""You are an expert assistant for exploring NSF research
-proposals stored in SOLR. Use the available tools to search and retrieve proposal data.
+Action: <tool_name>
+Action Input: <JSON object with arguments>
 
-Key fields: summary (project summary), description (full narrative), pi_name, inst,
-award_amount, directorate (BIO/CSE/ENG/GEO/MPS/SBE/EDU/TIP), received_year, status.
+Then stop. The result will be given back as:
+Observation: <result>
 
-Always use tools to answer questions — do not guess proposal content.""")
+After receiving an Observation you may call another tool or give a final answer.
+When you have enough information write:
+Final Answer: <your answer>
+
+Available tools:
+
+search_proposals(query, fields="id,title,summary", rows=5)
+  Search NSF proposals using Lucene syntax.
+  query examples: 'pi_name:"Jane Smith"', 'summary:(quantum computing)',
+                  'directorate:BIO AND received_year:[2020 TO 2024]'
+  fields: id, title, summary, description, pi_name, inst, award_amount,
+          directorate, received_year, status
+
+get_proposal(proposal_id, fields="id,title,summary,description,pi_name,inst,award_amount,directorate,received_year,status")
+  Retrieve a single proposal by ID (e.g. "2535312") with full text.
+
+fetch_proposals_by_ids(id_list, fields="id,title,summary,pi_name,award_amount")
+  Fetch multiple proposals by comma-separated IDs.
+  id_list example: "2535312,2535313"
+
+facet_proposals(query, facet_field, limit=15)
+  Count top values for a field. facet_field: directorate, division, inst,
+  inst_state, status, received_year, funding_program
+
+proposal_fields(group="")
+  List available field groups. group: fi_pin, fi_awd, fi_pnl etc.
+"""
+
+SYSTEM_PROMPT = f"""You are an expert assistant for exploring NSF research proposals in SOLR.
+{TOOL_DOCS}
+Rules:
+- ALWAYS use a tool to answer questions about proposals — never guess.
+- Output Action/Action Input on separate lines with no extra text between them.
+- Action Input must be valid JSON.
+- After the final Observation, write Final Answer.
+"""
 
 
 # ---------------------------------------------------------------------------
-# Simple tool-calling loop (no AgentExecutor needed)
+# ReAct loop
 # ---------------------------------------------------------------------------
+
+def _call_tool(name: str, args: dict) -> str:
+    fn = TOOL_MAP.get(name)
+    if fn is None:
+        return f"Unknown tool '{name}'. Available: {', '.join(TOOL_MAP)}"
+    try:
+        return fn(**args)
+    except TypeError as e:
+        return f"Bad arguments for {name}: {e}"
+
+
+def _parse_action(text: str):
+    """Return (tool_name, args_dict) or None if no action found."""
+    action_m = re.search(r"Action:\s*(\w+)", text)
+    input_m  = re.search(r"Action Input:\s*(\{.*?\})", text, re.DOTALL)
+    if not action_m:
+        return None
+    tool_name = action_m.group(1).strip()
+    if input_m:
+        try:
+            args = json.loads(input_m.group(1))
+        except json.JSONDecodeError:
+            args = {}
+    else:
+        args = {}
+    return tool_name, args
+
 
 def run_repl(model: str = "phi4", verbose: bool = False) -> None:
-    llm      = ChatOllama(model=model, temperature=0).bind_tools(TOOLS)
-    history  = []
-
     print(f"NSF SOLR Agent  (model={model}  solr={SOLR_URL})")
     print("Type 'quit' to exit, 'tools' to list tools.\n")
+
+    history: list[dict] = []   # ollama message format
 
     while True:
         try:
@@ -226,34 +263,46 @@ def run_repl(model: str = "phi4", verbose: bool = False) -> None:
         if user_input.lower() == "quit":
             break
         if user_input.lower() == "tools":
-            for t in TOOLS:
-                print(f"  {t.name}: {t.description.splitlines()[0]}")
+            for name in TOOL_MAP:
+                print(f"  {name}")
             continue
 
-        history.append(HumanMessage(content=user_input))
+        history.append({"role": "user", "content": user_input})
 
-        # Agentic loop: keep calling LLM until no more tool calls
-        for _ in range(6):   # max iterations
-            response = llm.invoke([SYSTEM] + history[-20:])
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-20:]
 
-            if not response.tool_calls:
-                # Final answer
-                print(f"\nAssistant: {response.content}\n")
-                history.append(AIMessage(content=response.content))
+        for step in range(8):
+            resp    = ollama.chat(model=model, messages=messages)
+            content = resp["message"]["content"]
+
+            if verbose:
+                print(f"\n  [step {step+1}] {content[:300]}")
+
+            # Check for Final Answer
+            fa_match = re.search(r"Final Answer:\s*(.*)", content, re.DOTALL)
+            action   = _parse_action(content)
+
+            if action is None or fa_match:
+                # Extract final answer text
+                answer = fa_match.group(1).strip() if fa_match else content.strip()
+                print(f"\nAssistant: {answer}\n")
+                history.append({"role": "assistant", "content": answer})
                 break
 
-            # Execute tool calls
-            history.append(response)
-            for tc in response.tool_calls:
-                if verbose:
-                    print(f"  [tool] {tc['name']}({json.dumps(tc['args'], ensure_ascii=False)[:120]})")
-                fn     = TOOL_MAP.get(tc["name"])
-                result = fn.invoke(tc["args"]) if fn else f"Unknown tool: {tc['name']}"
-                if verbose:
-                    print(f"  [result] {str(result)[:200]}")
-                history.append(ToolMessage(content=result, tool_call_id=tc["id"]))
+            tool_name, args = action
+            if verbose:
+                print(f"  [tool] {tool_name}({json.dumps(args)[:120]})")
+
+            observation = _call_tool(tool_name, args)
+            if verbose:
+                print(f"  [obs]  {observation[:200]}")
+
+            # Append assistant turn + observation to running messages
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user",
+                             "content": f"Observation: {observation}\n\nContinue."})
         else:
-            print("(reached max iterations)\n")
+            print("(reached max steps)\n")
 
         # Keep history bounded
         if len(history) > 40:
@@ -265,8 +314,8 @@ def run_repl(model: str = "phi4", verbose: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="NSF SOLR agent (Ollama)")
+    p = argparse.ArgumentParser(description="NSF SOLR ReAct agent (Ollama)")
     p.add_argument("--model",   default="phi4")
     p.add_argument("--verbose", action="store_true")
-    args = parse_args() if False else p.parse_args()
+    args = p.parse_args()
     run_repl(model=args.model, verbose=args.verbose)
