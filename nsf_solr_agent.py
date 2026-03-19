@@ -5,9 +5,15 @@ Default: uses ollama native tool-calling (llama3.1, llama3.2, qwen2.5, mistral-n
 Fallback: --react flag for models without tool support (phi4, older models).
 
 Usage:
-    python nsf_solr_agent.py                          # llama3.2 + native tools
-    python nsf_solr_agent.py --model llama3.1
-    python nsf_solr_agent.py --model phi4 --react     # ReAct text loop
+    python nsf_solr_agent.py                               # llama3.2 + native tools
+    python nsf_solr_agent.py --model llama3.1              # larger context window
+    python nsf_solr_agent.py --model phi4 --react          # ReAct fallback
+    python nsf_solr_agent.py --out panel_report.md         # save session to file
+
+Example queries:
+    facet all proposals by panel_name for directorate:BIO AND received_year:2024
+    get all proposals in panel_name:"BIO-2024-P01" with their titles and PIs
+    write a summary report of the top 10 funded CSE proposals in 2023
 
 Requirements:
     pip install ollama pysolr
@@ -271,8 +277,14 @@ def _run_tool(name: str, args: dict) -> str:
         return f"Bad arguments for {name}: {e}"
 
 
-def run_native(model: str, verbose: bool) -> None:
+def run_native(model: str, verbose: bool, outfile=None) -> None:
     history: list[dict] = []
+
+    def emit(text: str) -> None:
+        print(text)
+        if outfile:
+            outfile.write(text + "\n")
+            outfile.flush()
 
     while True:
         try:
@@ -290,17 +302,21 @@ def run_native(model: str, verbose: bool) -> None:
                 print(f"  {t['function']['name']}: {t['function']['description']}")
             continue
 
-        history.append({"role": "user", "content": user_input})
-        messages = [SYSTEM_MSG] + history[-20:]
+        if outfile:
+            outfile.write(f"\n## You: {user_input}\n\n")
+            outfile.flush()
 
-        for _ in range(8):
+        history.append({"role": "user", "content": user_input})
+        messages = [SYSTEM_MSG] + history[-30:]
+
+        for _ in range(16):
             resp    = ollama.chat(model=model, messages=messages, tools=OLLAMA_TOOLS)
             msg     = resp["message"]
             calls   = msg.get("tool_calls") or []
 
             if not calls:
                 answer = msg.get("content", "").strip()
-                print(f"\nAssistant: {answer}\n")
+                emit(f"\nAssistant: {answer}\n")
                 history.append({"role": "assistant", "content": answer})
                 break
 
@@ -409,17 +425,30 @@ def run_react(model: str, verbose: bool) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def run_repl(model: str = "llama3.2", verbose: bool = False, react: bool = False) -> None:
+def run_repl(model: str = "llama3.2", verbose: bool = False,
+             react: bool = False, out: str | None = None) -> None:
     if not verbose:
         sys.stderr = open(os.devnull, "w")
 
-    print(f"NSF SOLR Agent  (model={model}  mode={'react' if react else 'native'}  solr={SOLR_URL})")
+    mode = "react" if react else "native"
+    print(f"NSF SOLR Agent  (model={model}  mode={mode}  solr={SOLR_URL})")
+    if out:
+        print(f"Saving to: {out}")
     print("Type 'quit' to exit, 'tools' to list tools.\n")
 
-    if react:
-        run_react(model, verbose)
-    else:
-        run_native(model, verbose)
+    outfile = open(out, "w") if out else None
+    if outfile:
+        outfile.write(f"# NSF SOLR Session  model={model}\n\n")
+
+    try:
+        if react:
+            run_react(model, verbose)
+        else:
+            run_native(model, verbose, outfile=outfile)
+    finally:
+        if outfile:
+            outfile.close()
+            print(f"\nSession saved to {out}")
 
 
 if __name__ == "__main__":
@@ -429,6 +458,8 @@ if __name__ == "__main__":
     p.add_argument("--verbose", action="store_true",
                    help="Show tool calls and results")
     p.add_argument("--react",   action="store_true",
-                   help="Use ReAct text loop (for models without native tool support, e.g. phi4)")
+                   help="Use ReAct text loop (for phi4 and models without native tool support)")
+    p.add_argument("--out",     default=None, metavar="FILE",
+                   help="Save session to a markdown file e.g. --out panel_report.md")
     args = p.parse_args()
-    run_repl(model=args.model, verbose=args.verbose, react=args.react)
+    run_repl(model=args.model, verbose=args.verbose, react=args.react, out=args.out)
