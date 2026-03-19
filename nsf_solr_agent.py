@@ -38,19 +38,37 @@ TIMEOUT  = 30
 
 FIELD_GROUPS = {
     "fi_pid": "id",
+    "fi_typ": "lead_id, lead_proposal",
+    "fi_dat": "received, received_year, load_date, pm_rcom_date, received_to_rcom_days",
+    "fi_stu": "status",
     "fi_tle": "title",
     "fi_sum": "summary",
-    "fi_des": "description",
+    "fi_des": "description, description_length",
     "fi_bio": "bio",
     "fi_dmp": "data_management",
+    "fi_fac": "facilities",
+    "fi_mem": "mentoring",
+    "fi_ref": "references",
+    "fi_sup": "supplementary",
+    "fi_add": "additional_documents",
+    "fi_cap": "support",
     "fi_bju": "budget",
-    "fi_pin": "pi_name, pi_email, inst, inst_state",
-    "fi_awd": "award_amount, award_date, funding_program",
-    "fi_uni": "directorate, division, managing_program",
-    "fi_dat": "received, received_year, status",
-    "fi_pnl": "panel_id, panel_name, panel_reviewers, panel_start_date",
-    "fi_snr": "senior_name, senior_inst",
-    "fi_int": "foreign_colb_country, intl_actv_flag",
+    "fi_uni": "directorate, division, managing_program, managing_program_code",
+    "fi_req": "natr_rqst_code, rqst_mnth_cnt, requested_amount",
+    "fi_sub": "program_announcement, program_director, prop_po_name",
+    "fi_coi": "proposal_coi_flag",
+    "fi_awd": "award_amount, award_date, awd_exp_date, awd_istr_code, awd_po_name, dd_rcom_date, funding_program, funding_program_code, funding_program_count",
+    "fi_pia": "pi_id, inst_attr, pi_degree, pi_degree_year, pi_race, pi_disability, pi_ethnicity, pi_gender, pi_project_role",
+    "fi_pin": "pi_all, pi_email, pi_name, inst, inst_state, pi_inst, pi_city, pi_state",
+    "fi_snr": "senior_name, senior_inst, senior_title",
+    "fi_sgr": "suggested_reviewers",
+    "fi_pan": "panel_id",
+    "fi_pnl": "panel_name, panel_org_code, panel_count, panel_end_date, panel_reviewers, panel_start_date",
+    "fi_rwa": "reviewer_id, reviewer_count, reviewer_disability, reviewer_gender, reviewer_ethnicity, reviewer_race, reviewer_status",
+    "fi_rwn": "reviewer_all, reviewer_name, reviewer_department, reviewer_email, reviewer_inst",
+    "fi_cor": "collaborators",
+    "fi_int": "foreign_colb_country, foreign_colb_country_code, foreign_country, foreign_country_code, intl_actv_flag, nsf_fund_trav_intl_flag",
+    "fi_oth": "obj_clas_code, pdf_location, prc_code, summary_length, deviation_authorization, corpus",
 }
 
 
@@ -259,28 +277,41 @@ Use tools to answer every question — never guess proposal content.
 
 FIELD REFERENCE:
   id, title, summary, description
-  pi_name, pi_email, inst, inst_state
-  award_amount, award_date, funding_program
+  pi_name, pi_all, pi_email, inst, inst_state, pi_inst, pi_city, pi_state
+  award_amount, award_date, funding_program, funding_program_code, requested_amount
   directorate, division, managing_program
-  received_year, status
-  panel_id, panel_name, panel_reviewers, panel_start_date
+  received, received_year, status
+  panel_id, panel_name, panel_org_code, panel_reviewers, panel_start_date, panel_end_date
+  pi_gender, pi_race, pi_ethnicity, pi_degree, pi_degree_year
+  reviewer_name, reviewer_inst, reviewer_gender
+
+STATUS FIELD — values are full strings, must be quoted:
+  Awarded:  status:"Proposal has been awarded"
+            status:"Pending, PM recommends award"
+            status:"Recommended for award, DDConcurred"
+  Declined: status:"Decline, DDConcurred"
+            status:"Pending, PM recommends decline"
+  Pending:  status:"Pending, Review Package Produced"
+            status:"Pending, Assigned to PM"
+  Multi:    status:("Proposal has been awarded" OR "Pending, PM recommends award" OR "Recommended for award, DDConcurred")
+  NEVER use status:Awarded or status:awarded — those will return nothing.
 
 LUCENE QUERY EXAMPLES:
-  All proposals in a panel:   panel_id:P260135
-  Panel name contains string: panel_name:*keyword*
-  By PI:                      pi_name:"Jane Smith"
-  By keyword in summary:      summary:(quantum computing)
-  By directorate + year:      directorate:BIO AND received_year:2024
-  By award range:             award_amount:[500000 TO *]
-  Awarded only:               status:Awarded
+  Proposals in a panel:        panel_id:P260135
+  Awarded in panel:            panel_id:P260135 AND status:"Proposal has been awarded"
+  Declined in panel:           panel_id:P260135 AND status:"Decline, DDConcurred"
+  All awarded statuses:        status:("Proposal has been awarded" OR "Pending, PM recommends award" OR "Recommended for award, DDConcurred")
+  By PI:                       pi_name:"Jane Smith"
+  By keyword in summary:       summary:(quantum computing)
+  By directorate + year:       directorate:BIO AND received_year:2024
+  By award range:              award_amount:[500000 TO *]
 
 COMMON PATTERNS:
-  - "list proposals in panel X"  → search_proposals(query="panel_id:X", fields="id,title,pi_name,status", rows=50)
-  - "all funded proposals in X directorate" → search_proposals(query="directorate:X AND status:Awarded", fields="id,title,pi_name,award_amount", rows=50)
+  - "proposals in panel X"     → search_proposals(query="panel_id:X", fields="id,title,pi_name,inst,status", rows=50)
+  - "awarded in panel X"       → search_proposals(query='panel_id:X AND status:"Proposal has been awarded"', fields="id,title,pi_name,award_amount", rows=50)
+  - "what panels exist"        → facet_proposals(query="directorate:BIO AND received_year:2024", facet_field="panel_id", limit=50)
   - "breakdown by institution" → facet_proposals(query="...", facet_field="inst")
-  - "what panels exist in BIO 2024" → facet_proposals(query="directorate:BIO AND received_year:2024", facet_field="panel_id", limit=50)
-
-If a query returns no results, try wildcard: panel_name:*P260135* instead of panel_name:P260135
+  - "award rate by division"   → facet_proposals(query='status:"Proposal has been awarded"', facet_field="division")
 """,
 }
 
@@ -372,6 +403,14 @@ get_proposal(proposal_id, fields="id,title,summary,description,pi_name,inst,awar
 fetch_proposals_by_ids(id_list, fields="id,title,summary,pi_name,award_amount")
 facet_proposals(query, facet_field, limit=15)
 proposal_fields(group="")
+
+STATUS FIELD uses full strings — always quote them:
+  Awarded:  status:"Proposal has been awarded"
+  Declined: status:"Decline, DDConcurred"
+  Pending:  status:"Pending, Review Package Produced"
+  NEVER use status:Awarded — it returns nothing.
+
+Panel queries use panel_id field: panel_id:P260135
 
 To call a tool output EXACTLY (no extra text before Action:):
 Action: <tool_name>
