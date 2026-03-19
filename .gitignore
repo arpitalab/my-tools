@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Large data files — keep scripts, not data
+output/
+nsf_awards.db
+nsf_awards.db-shm
+nsf_awards.db-wal
+
+# Secrets
+.env
+*_pwd.py
