@@ -645,6 +645,22 @@ def hybrid_search(query_text: str, top_n: int = 10,
         return f"Hybrid search error: {e}"
 
 
+def match_abstract(abstract: str, top_n: int = 10,
+                   directorate: str = "", year_start: int = 0,
+                   year_end: int = 0) -> str:
+    """Find NSF awards most similar to a pasted abstract or research description.
+    Uses the same hybrid SPECTER2+TF-IDF+BM25 pipeline as the panel builder app.
+    This is the right tool whenever the user pastes an abstract or asks
+    'find proposals similar to this' — do NOT use search_proposals for this.
+    abstract:    the full abstract or research description text
+    top_n:       number of matches to return (default 10, max 50)
+    directorate: optional filter e.g. BIO, CSE, ENG
+    year_start / year_end: optional year range
+    """
+    return hybrid_search(abstract, top_n=top_n, directorate=directorate,
+                         year_start=year_start, year_end=year_end)
+
+
 def get_award(award_id: str) -> str:
     """Get full details for a specific NSF award: abstract, investigators, program elements.
     award_id: NSF award number e.g. '2535312'
@@ -781,6 +797,7 @@ TOOL_MAP = {
     # SQLite tools
     "db_schema":              db_schema,
     "sql_query":              sql_query,
+    "match_abstract":         match_abstract,
     "semantic_search":        semantic_search,
     "hybrid_search":          hybrid_search,
     "get_award":              get_award,
@@ -925,8 +942,31 @@ OLLAMA_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "match_abstract",
+            "description": (
+                "Find NSF awards most similar to a pasted abstract or research description. "
+                "Uses the same SPECTER2+TF-IDF+BM25 pipeline as the panel builder app. "
+                "USE THIS whenever the user pastes an abstract or says 'find similar proposals'. "
+                "Do NOT use search_proposals for abstract matching."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "abstract":    {"type": "string",  "description": "the full abstract or research description"},
+                    "top_n":       {"type": "integer", "description": "number of matches (default 10, max 50)"},
+                    "directorate": {"type": "string",  "description": "optional filter: BIO, CSE, ENG, MPS etc."},
+                    "year_start":  {"type": "integer", "description": "optional start year"},
+                    "year_end":    {"type": "integer", "description": "optional end year"},
+                },
+                "required": ["abstract"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "semantic_search",
-            "description": "Find awarded NSF grants semantically similar to a natural-language query using SPECTER2 embeddings. Best for concept/topic discovery without exact keywords.",
+            "description": "Find awarded NSF grants semantically similar to a short natural-language description (a few words or sentences). For full abstracts use match_abstract instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1003,10 +1043,11 @@ DATA SOURCES:
 - SQLite (local): 162k awarded grants 2010-2024, semantic search, PI profiles, SQL analytics
 
 WHEN TO USE EACH:
-- Proposal text, declines, panels, reviewers → SOLR (search_proposals, get_proposal)
-- Concept/topic discovery → SQLite semantic_search or hybrid_search
-- Funding trends, counts, aggregations → SQLite sql_query
-- PI career history → SQLite get_researcher
+- User pastes an abstract or says "find similar" → match_abstract (SPECTER2+BM25, same as panel builder)
+- Short topic query ("quantum computing grants") → semantic_search
+- Proposal text, declines, panels, reviewers → search_proposals or get_proposal (SOLR)
+- Funding trends, counts, aggregations → sql_query (SQLite)
+- PI career history → get_researcher (SQLite)
 
 SOLR FILTERS (pass as separate arguments, never write Lucene syntax):
   directorate: BIO | CSE | ENG | GEO | MPS | SBE | EDU | TIP
