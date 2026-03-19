@@ -1,12 +1,13 @@
 """
-nsf_solr_agent.py — Ollama ReAct agent over the NSF SOLR database.
+nsf_solr_agent.py — Ollama agent over the NSF SOLR database.
 
-Uses a ReAct (Reason + Act) text loop — works with ANY Ollama model
-including phi4, llama3, mistral etc. No native tool-calling required.
+Default: uses ollama native tool-calling (llama3.1, llama3.2, qwen2.5, mistral-nemo).
+Fallback: --react flag for models without tool support (phi4, older models).
 
 Usage:
-    python nsf_solr_agent.py
-    python nsf_solr_agent.py --model phi4 --verbose
+    python nsf_solr_agent.py                          # llama3.2 + native tools
+    python nsf_solr_agent.py --model llama3.1
+    python nsf_solr_agent.py --model phi4 --react     # ReAct text loop
 
 Requirements:
     pip install ollama pysolr
@@ -21,7 +22,6 @@ import sys
 
 import ollama
 import pysolr
-
 
 # ---------------------------------------------------------------------------
 # Config
@@ -53,7 +53,7 @@ def _solr() -> pysolr.Solr:
 
 
 # ---------------------------------------------------------------------------
-# Tools (plain functions — no decorator needed)
+# Tool implementations
 # ---------------------------------------------------------------------------
 
 def search_proposals(query: str, fields: str = "id,title,summary", rows: int = 5) -> str:
@@ -68,9 +68,7 @@ def search_proposals(query: str, fields: str = "id,title,summary", rows: int = 5
                 f = f.strip()
                 if f not in ("id", "title") and f in doc:
                     val = str(doc[f])
-                    if len(val) > 400:
-                        val = val[:400] + "…"
-                    lines.append(f"  {f}: {val}")
+                    lines.append(f"  {f}: {val[:400] + '…' if len(val) > 400 else val}")
             lines.append("")
         return "\n".join(lines)
     except Exception as e:
@@ -158,105 +156,196 @@ def proposal_fields(group: str = "") -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Tool registry
-# ---------------------------------------------------------------------------
-
 TOOL_MAP = {
-    "search_proposals":      search_proposals,
-    "get_proposal":          get_proposal,
+    "search_proposals":       search_proposals,
+    "get_proposal":           get_proposal,
     "fetch_proposals_by_ids": fetch_proposals_by_ids,
-    "facet_proposals":       facet_proposals,
-    "proposal_fields":       proposal_fields,
+    "facet_proposals":        facet_proposals,
+    "proposal_fields":        proposal_fields,
 }
 
-TOOL_DOCS = """
-You have access to these tools. To call a tool, output EXACTLY:
+# ---------------------------------------------------------------------------
+# Ollama native tool definitions
+# ---------------------------------------------------------------------------
 
-Action: <tool_name>
-Action Input: <JSON object with arguments>
+OLLAMA_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_proposals",
+            "description": "Search NSF proposals using Lucene query syntax.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":  {"type": "string",  "description": "Lucene query, e.g. 'pi_name:\"Jane Smith\"' or 'summary:(quantum computing)'"},
+                    "fields": {"type": "string",  "description": "comma-separated fields: id,title,summary,description,pi_name,inst,award_amount,directorate,received_year,status"},
+                    "rows":   {"type": "integer", "description": "number of results (max 50)"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_proposal",
+            "description": "Retrieve a single NSF proposal by ID with full text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "proposal_id": {"type": "string", "description": "NSF proposal ID, e.g. '2535312'"},
+                    "fields":      {"type": "string", "description": "comma-separated fields to return"},
+                },
+                "required": ["proposal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_proposals_by_ids",
+            "description": "Fetch multiple proposals by comma-separated IDs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id_list": {"type": "string", "description": "comma-separated IDs e.g. '2535312,2535313'"},
+                    "fields":  {"type": "string", "description": "fields to return for each proposal"},
+                },
+                "required": ["id_list"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "facet_proposals",
+            "description": "Count top values for a field across matching proposals.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":       {"type": "string",  "description": "Lucene query selecting proposals to count"},
+                    "facet_field": {"type": "string",  "description": "field to break down: directorate, division, inst, inst_state, status, received_year, funding_program"},
+                    "limit":       {"type": "integer", "description": "number of top values to show"},
+                },
+                "required": ["query", "facet_field"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "proposal_fields",
+            "description": "List available NSF proposal field groups.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group": {"type": "string", "description": "optional group code e.g. fi_pin, fi_awd"},
+                },
+            },
+        },
+    },
+]
 
-Then stop. The result will be given back as:
-Observation: <result>
-
-After receiving an Observation you may call another tool or give a final answer.
-When you have enough information write:
-Final Answer: <your answer>
-
-Available tools:
-
-search_proposals(query, fields="id,title,summary", rows=5)
-  Search NSF proposals using Lucene syntax.
-  query examples: 'pi_name:"Jane Smith"', 'summary:(quantum computing)',
-                  'directorate:BIO AND received_year:[2020 TO 2024]'
-  fields: id, title, summary, description, pi_name, inst, award_amount,
-          directorate, received_year, status
-
-get_proposal(proposal_id, fields="id,title,summary,description,pi_name,inst,award_amount,directorate,received_year,status")
-  Retrieve a single proposal by ID (e.g. "2535312") with full text.
-
-fetch_proposals_by_ids(id_list, fields="id,title,summary,pi_name,award_amount")
-  Fetch multiple proposals by comma-separated IDs.
-  id_list example: "2535312,2535313"
-
-facet_proposals(query, facet_field, limit=15)
-  Count top values for a field. facet_field: directorate, division, inst,
-  inst_state, status, received_year, funding_program
-
-proposal_fields(group="")
-  List available field groups. group: fi_pin, fi_awd, fi_pnl etc.
-"""
-
-SYSTEM_PROMPT = f"""You are an expert assistant for exploring NSF research proposals in SOLR.
-{TOOL_DOCS}
-Rules:
-- ALWAYS use a tool to answer questions about proposals — never guess.
-- Output Action/Action Input on separate lines with no extra text between them.
-- Action Input must be valid JSON.
-- After the final Observation, write Final Answer.
-"""
+SYSTEM_MSG = {
+    "role": "system",
+    "content": (
+        "You are an expert assistant for exploring NSF research proposals in SOLR. "
+        "Use the available tools to answer questions. "
+        "Key fields: summary, description, pi_name, inst, award_amount, "
+        "directorate (BIO/CSE/ENG/GEO/MPS/SBE/EDU/TIP), received_year, status."
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
-# ReAct loop
+# Native tool-calling loop
 # ---------------------------------------------------------------------------
 
-def _call_tool(name: str, args: dict) -> str:
+def _run_tool(name: str, args: dict) -> str:
     fn = TOOL_MAP.get(name)
     if fn is None:
-        return f"Unknown tool '{name}'. Available: {', '.join(TOOL_MAP)}"
+        return f"Unknown tool '{name}'"
     try:
         return fn(**args)
     except TypeError as e:
         return f"Bad arguments for {name}: {e}"
 
 
-def _parse_action(text: str):
-    """Return (tool_name, args_dict) or None if no action found."""
-    action_m = re.search(r"Action:\s*(\w+)", text)
-    input_m  = re.search(r"Action Input:\s*(\{.*?\})", text, re.DOTALL)
-    if not action_m:
-        return None
-    tool_name = action_m.group(1).strip()
-    if input_m:
+def run_native(model: str, verbose: bool) -> None:
+    history: list[dict] = []
+
+    while True:
         try:
-            args = json.loads(input_m.group(1))
-        except json.JSONDecodeError:
-            args = {}
-    else:
-        args = {}
-    return tool_name, args
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() == "quit":
+            break
+        if user_input.lower() == "tools":
+            for t in OLLAMA_TOOLS:
+                print(f"  {t['function']['name']}: {t['function']['description']}")
+            continue
+
+        history.append({"role": "user", "content": user_input})
+        messages = [SYSTEM_MSG] + history[-20:]
+
+        for _ in range(8):
+            resp    = ollama.chat(model=model, messages=messages, tools=OLLAMA_TOOLS)
+            msg     = resp["message"]
+            calls   = msg.get("tool_calls") or []
+
+            if not calls:
+                answer = msg.get("content", "").strip()
+                print(f"\nAssistant: {answer}\n")
+                history.append({"role": "assistant", "content": answer})
+                break
+
+            messages.append(msg)
+            for tc in calls:
+                fn_info = tc.get("function", tc)
+                name    = fn_info["name"]
+                args    = fn_info.get("arguments", {})
+                if verbose:
+                    print(f"  [tool] {name}({json.dumps(args)[:120]})")
+                result = _run_tool(name, args)
+                if verbose:
+                    print(f"  [result] {result[:200]}")
+                messages.append({"role": "tool", "content": result})
+        else:
+            print("(reached max steps)\n")
+
+        if len(history) > 40:
+            history = history[-40:]
 
 
-def run_repl(model: str = "phi4", verbose: bool = False) -> None:
-    # Suppress ollama server noise (Metal GPU messages, timing lines)
-    if not verbose:
-        sys.stderr = open(os.devnull, "w")
+# ---------------------------------------------------------------------------
+# ReAct fallback (for models without native tool support, e.g. phi4)
+# ---------------------------------------------------------------------------
 
-    print(f"NSF SOLR Agent  (model={model}  solr={SOLR_URL})")
-    print("Type 'quit' to exit, 'tools' to list tools.\n")
+REACT_SYSTEM = f"""You are an expert assistant for NSF research proposals.
+You have these tools:
 
-    history: list[dict] = []   # ollama message format
+search_proposals(query, fields="id,title,summary", rows=5)
+get_proposal(proposal_id, fields="id,title,summary,description,pi_name,inst,award_amount,directorate,received_year,status")
+fetch_proposals_by_ids(id_list, fields="id,title,summary,pi_name,award_amount")
+facet_proposals(query, facet_field, limit=15)
+proposal_fields(group="")
+
+To call a tool output EXACTLY (no extra text before Action:):
+Action: <tool_name>
+Action Input: {{"key": "value"}}
+
+After the Observation write either another Action or:
+Final Answer: <your answer>
+"""
+
+
+def run_react(model: str, verbose: bool) -> None:
+    history: list[dict] = []
 
     while True:
         try:
@@ -275,43 +364,43 @@ def run_repl(model: str = "phi4", verbose: bool = False) -> None:
             continue
 
         history.append({"role": "user", "content": user_input})
-
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-20:]
+        messages = [{"role": "system", "content": REACT_SYSTEM}] + history[-20:]
 
         for step in range(8):
             resp    = ollama.chat(model=model, messages=messages)
             content = resp["message"]["content"]
-
             if verbose:
-                print(f"\n  [step {step+1}] {content[:300]}")
+                print(f"\n  [step {step+1}] {content[:400]}")
 
-            # Check for Final Answer
-            fa_match = re.search(r"Final Answer:\s*(.*)", content, re.DOTALL)
-            action   = _parse_action(content)
+            fa = re.search(r"Final Answer:\s*(.*)", content, re.DOTALL)
+            am = re.search(r"Action:\s*(\w+)", content)
+            im = re.search(r"Action Input:\s*(\{.*?\})", content, re.DOTALL)
 
-            if action is None or fa_match:
-                # Extract final answer text
-                answer = fa_match.group(1).strip() if fa_match else content.strip()
+            if fa or not am:
+                answer = fa.group(1).strip() if fa else content.strip()
                 print(f"\nAssistant: {answer}\n")
                 history.append({"role": "assistant", "content": answer})
                 break
 
-            tool_name, args = action
-            if verbose:
-                print(f"  [tool] {tool_name}({json.dumps(args)[:120]})")
+            name = am.group(1).strip()
+            args = {}
+            if im:
+                try:
+                    args = json.loads(im.group(1))
+                except json.JSONDecodeError:
+                    pass
 
-            observation = _call_tool(tool_name, args)
             if verbose:
-                print(f"  [obs]  {observation[:200]}")
+                print(f"  [tool] {name}({json.dumps(args)[:120]})")
+            result = _run_tool(name, args)
+            if verbose:
+                print(f"  [obs]  {result[:200]}")
 
-            # Append assistant turn + observation to running messages
             messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user",
-                             "content": f"Observation: {observation}\n\nContinue."})
+            messages.append({"role": "user", "content": f"Observation: {result}\n\nContinue."})
         else:
             print("(reached max steps)\n")
 
-        # Keep history bounded
         if len(history) > 40:
             history = history[-40:]
 
@@ -320,9 +409,26 @@ def run_repl(model: str = "phi4", verbose: bool = False) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def run_repl(model: str = "llama3.2", verbose: bool = False, react: bool = False) -> None:
+    if not verbose:
+        sys.stderr = open(os.devnull, "w")
+
+    print(f"NSF SOLR Agent  (model={model}  mode={'react' if react else 'native'}  solr={SOLR_URL})")
+    print("Type 'quit' to exit, 'tools' to list tools.\n")
+
+    if react:
+        run_react(model, verbose)
+    else:
+        run_native(model, verbose)
+
+
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="NSF SOLR ReAct agent (Ollama)")
-    p.add_argument("--model",   default="phi4")
-    p.add_argument("--verbose", action="store_true")
+    p = argparse.ArgumentParser(description="NSF SOLR agent (Ollama)")
+    p.add_argument("--model",   default="llama3.2",
+                   help="Ollama model (default: llama3.2). Use llama3.1 for larger context.")
+    p.add_argument("--verbose", action="store_true",
+                   help="Show tool calls and results")
+    p.add_argument("--react",   action="store_true",
+                   help="Use ReAct text loop (for models without native tool support, e.g. phi4)")
     args = p.parse_args()
-    run_repl(model=args.model, verbose=args.verbose)
+    run_repl(model=args.model, verbose=args.verbose, react=args.react)
