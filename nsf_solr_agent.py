@@ -48,7 +48,7 @@ FIELD_GROUPS = {
     "fi_awd": "award_amount, award_date, funding_program",
     "fi_uni": "directorate, division, managing_program",
     "fi_dat": "received, received_year, status",
-    "fi_pnl": "panel_name, panel_reviewers, panel_start_date",
+    "fi_pnl": "panel_id, panel_name, panel_reviewers, panel_start_date",
     "fi_snr": "senior_name, senior_inst",
     "fi_int": "foreign_colb_country, intl_actv_flag",
 }
@@ -263,11 +263,11 @@ FIELD REFERENCE:
   award_amount, award_date, funding_program
   directorate, division, managing_program
   received_year, status
-  panel_name, panel_reviewers, panel_start_date
+  panel_id, panel_name, panel_reviewers, panel_start_date
 
 LUCENE QUERY EXAMPLES:
-  All proposals in a panel:   panel_name:P260135
-  Panel name contains string: panel_name:*P260135*
+  All proposals in a panel:   panel_id:P260135
+  Panel name contains string: panel_name:*keyword*
   By PI:                      pi_name:"Jane Smith"
   By keyword in summary:      summary:(quantum computing)
   By directorate + year:      directorate:BIO AND received_year:2024
@@ -275,10 +275,10 @@ LUCENE QUERY EXAMPLES:
   Awarded only:               status:Awarded
 
 COMMON PATTERNS:
-  - "list proposals in panel X"  → search_proposals(query="panel_name:X", fields="id,title,pi_name,status", rows=50)
+  - "list proposals in panel X"  → search_proposals(query="panel_id:X", fields="id,title,pi_name,status", rows=50)
   - "all funded proposals in X directorate" → search_proposals(query="directorate:X AND status:Awarded", fields="id,title,pi_name,award_amount", rows=50)
   - "breakdown by institution" → facet_proposals(query="...", facet_field="inst")
-  - "what panels exist in BIO 2024" → facet_proposals(query="directorate:BIO AND received_year:2024", facet_field="panel_name", limit=50)
+  - "what panels exist in BIO 2024" → facet_proposals(query="directorate:BIO AND received_year:2024", facet_field="panel_id", limit=50)
 
 If a query returns no results, try wildcard: panel_name:*P260135* instead of panel_name:P260135
 """,
