@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import sys
 
 import ollama
 import pysolr
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -246,6 +249,10 @@ def _parse_action(text: str):
 
 
 def run_repl(model: str = "phi4", verbose: bool = False) -> None:
+    # Suppress ollama server noise (Metal GPU messages, timing lines)
+    if not verbose:
+        sys.stderr = open(os.devnull, "w")
+
     print(f"NSF SOLR Agent  (model={model}  solr={SOLR_URL})")
     print("Type 'quit' to exit, 'tools' to list tools.\n")
 
