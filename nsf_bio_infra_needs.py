@@ -19,21 +19,27 @@ Signals scored per proposal:
   monitoring_network — long-term observational / field station needs
 
 Output (output/bio/):
-  bio_infra_scores.csv              — one row per proposal, all signal scores
-  bio_infra_division_heatmap.html   — division × signal heatmap (mean density)
-  bio_infra_opportunities.html      — top proposals by composite score
-  bio_infra_trends.html             — signal trends by year across BIO
+  bio_infra_scores.csv                       — one row per proposal, all signal scores
+  bio_infra_division_heatmap.html            — division × signal heatmap (mean density)
+  bio_infra_opportunities.html               — top proposals scored on abstract
+  bio_infra_opportunities_enriched.html      — top proposals re-scored on full SOLR narrative
+  bio_infra_trends.html                      — signal trends by year across BIO
+  bio_infra_top_proposals.html               — ranked table top 50
 
 Usage:
     python nsf_bio_infra_needs.py
     python nsf_bio_infra_needs.py --db output/bio/nsf_bio.db --out output/bio
     python nsf_bio_infra_needs.py --db output/nsf_awards.db  --out output/bio
+
+    # Re-score top 300 proposals on full SOLR narrative (requires NSF VPN):
+    python nsf_bio_infra_needs.py --enrich-top 300
 """
 from __future__ import annotations
 
 import argparse
 import re
 import sqlite3
+import time
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +48,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from tqdm import tqdm
+
+SOLR_URL = "http://dis-checker-a01.ad.nsf.gov/solr/proposals/"
+SOLR_TIMEOUT = 60
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -379,8 +388,74 @@ def viz_division_heatmap(df: pd.DataFrame, out_dir: Path) -> None:
     print(f"Saved {path}")
 
 
-def viz_opportunities(df: pd.DataFrame, out_dir: Path, top_n: int = 200) -> None:
-    """Top proposals by composite score — scatter of coordination vs scale."""
+def enrich_from_solr(df: pd.DataFrame, top_n: int, batch: int = 50) -> pd.DataFrame:
+    """Re-score the top_n proposals (by composite) using full SOLR description text.
+
+    Fetches the 'description' field (full project narrative) from SOLR in batches,
+    replaces the abstract-based scores with full-text scores, and returns the
+    enriched subset. Requires NSF VPN.
+    """
+    try:
+        import pysolr
+    except ImportError:
+        print("pysolr not installed — skipping SOLR enrichment (pip install pysolr)")
+        return df.head(0)
+
+    top = df.nlargest(top_n, "composite").copy()
+    ids = top["id"].astype(str).tolist()
+
+    print(f"\nFetching full descriptions from SOLR for {len(ids)} proposals …")
+    solr    = pysolr.Solr(SOLR_URL, timeout=SOLR_TIMEOUT)
+    fetched: dict[str, str] = {}
+
+    for i in tqdm(range(0, len(ids), batch), unit="batch"):
+        chunk = ids[i:i + batch]
+        query = "id:(" + " OR ".join(chunk) + ")"
+        try:
+            results = solr.search(query, **{"fl": "id,description", "rows": len(chunk)})
+            for doc in results:
+                desc = doc.get("description", "")
+                if isinstance(desc, list):
+                    desc = " ".join(desc)
+                if desc:
+                    fetched[str(doc["id"])] = desc
+        except Exception as e:
+            print(f"\nSOLR error (check VPN): {e}")
+            break
+        time.sleep(0.5)
+
+    if not fetched:
+        print("No descriptions retrieved — enriched scatter not generated.")
+        return top.head(0)
+
+    print(f"Retrieved full descriptions for {len(fetched):,} of {len(ids)} proposals.")
+
+    signal_cols = list(SIGNALS.keys())
+    enriched_rows = []
+    for _, row in top.iterrows():
+        pid  = str(row["id"])
+        text = fetched.get(pid)
+        if not text:
+            continue
+        new_scores = score_text(text)
+        r = row.copy()
+        for sig in signal_cols:
+            r[sig] = new_scores[sig]
+        r["composite"] = composite(r)
+        r["_text_source"] = "description"
+        enriched_rows.append(r)
+
+    if not enriched_rows:
+        return top.head(0)
+
+    enriched = pd.DataFrame(enriched_rows)
+    print(f"Re-scored {len(enriched):,} proposals on full narrative text.")
+    return enriched
+
+
+def viz_opportunities(df: pd.DataFrame, out_dir: Path, top_n: int = 200,
+                      enriched: pd.DataFrame | None = None) -> None:
+    """Top proposals by composite score — scatter of coordination vs reference resource."""
     top = df.nlargest(top_n, "composite").copy()
     top["year"] = top["year"].fillna(0).astype(int).astype(str)
     div_col = "division" if "division" in top.columns else "directorate"
@@ -418,6 +493,44 @@ def viz_opportunities(df: pd.DataFrame, out_dir: Path, top_n: int = 200) -> None
     path = out_dir / "bio_infra_opportunities.html"
     fig.write_html(str(path))
     print(f"Saved {path}")
+
+    # --- Enriched scatter (full SOLR description text) ---
+    if enriched is not None and len(enriched) > 0:
+        enr = enriched.copy()
+        enr["year"] = enr["year"].fillna(0).astype(int).astype(str)
+        enr[div_col] = enr[div_col].fillna("Unknown") if div_col in enr.columns else "Unknown"
+
+        fig2 = px.scatter(
+            enr,
+            x="coordination_need",
+            y="reference_resource",
+            size="composite",
+            color=div_col,
+            hover_name="title",
+            hover_data={
+                "id": True,
+                "year": True,
+                "inst": True,
+                "composite": ":.3f",
+                "data_resource": ":.3f",
+                "scale_barrier": ":.3f",
+                "standards": ":.3f",
+            },
+            size_max=30,
+            title=(
+                f"Top {len(enr)} BIO Proposals — Re-scored on Full Narrative (SOLR description)<br>"
+                "<sup>x = coordination gap signal | y = reference resource signal | "
+                "size = composite score</sup>"
+            ),
+            labels={
+                "coordination_need":  "Coordination Gap (density/1000 words)",
+                "reference_resource": "Reference Resource Need (density/1000 words)",
+            },
+        )
+        fig2.update_layout(height=700)
+        path2 = out_dir / "bio_infra_opportunities_enriched.html"
+        fig2.write_html(str(path2))
+        print(f"Saved {path2}")
 
 
 def viz_trends(df: pd.DataFrame, out_dir: Path) -> None:
@@ -550,6 +663,9 @@ def parse_args():
                    help=f"Output directory (default: {_OUT_DIR})")
     p.add_argument("--top-n", type=int, default=200,
                    help="Number of top proposals for opportunity scatter (default 200)")
+    p.add_argument("--enrich-top", type=int, default=0, metavar="N",
+                   help="Re-score top N proposals on full SOLR description text "
+                        "and write an enriched scatter (requires NSF VPN, default: off)")
     return p.parse_args()
 
 
@@ -568,9 +684,13 @@ def main():
     df = run(db, out)
     print_summary(df)
 
+    enriched = None
+    if args.enrich_top > 0:
+        enriched = enrich_from_solr(df, top_n=args.enrich_top)
+
     print("\nGenerating visualizations …")
     viz_division_heatmap(df, out)
-    viz_opportunities(df, out, top_n=args.top_n)
+    viz_opportunities(df, out, top_n=args.top_n, enriched=enriched)
     viz_trends(df, out)
     viz_top_table(df, out)
 
