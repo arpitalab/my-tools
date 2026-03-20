@@ -389,7 +389,7 @@ def viz_opportunities(df: pd.DataFrame, out_dir: Path, top_n: int = 200) -> None
     fig = px.scatter(
         top,
         x="coordination_need",
-        y="scale_barrier",
+        y="reference_resource",
         size="composite",
         color=div_col,
         hover_name="title",
@@ -399,18 +399,18 @@ def viz_opportunities(df: pd.DataFrame, out_dir: Path, top_n: int = 200) -> None
             "inst": True,
             "composite": ":.3f",
             "data_resource": ":.3f",
-            "reference_resource": ":.3f",
+            "scale_barrier": ":.3f",
             "standards": ":.3f",
         },
         size_max=30,
         title=(
             f"Top {top_n} BIO Proposals by Infrastructure Need<br>"
-            "<sup>x = coordination gap signal | y = scale barrier signal | "
+            "<sup>x = coordination gap signal | y = reference resource signal | "
             "size = composite score</sup>"
         ),
         labels={
-            "coordination_need": "Coordination Gap (density/1000 words)",
-            "scale_barrier":     "Scale Barrier (density/1000 words)",
+            "coordination_need":  "Coordination Gap (density/1000 words)",
+            "reference_resource": "Reference Resource Need (density/1000 words)",
         },
     )
     fig.update_layout(height=700)
