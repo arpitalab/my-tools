@@ -237,7 +237,12 @@ def _build_query(keywords: str = "", directorate: str = "", year: int = 0,
         else:
             clauses.append(f'status:"{status}"')
     if pi_name:
-        clauses.append(f'pi_name:"{pi_name}"')
+        # pi_name = lead PI only; pi_all = all investigators including co-PIs.
+        # Search both so co-PI proposals are not missed.
+        # Also add a wildcard clause so "Smith" matches "Jane Smith" etc.
+        name_q = (f'(pi_name:"{pi_name}" OR pi_all:"{pi_name}"'
+                  f' OR pi_name:{pi_name}* OR pi_all:{pi_name}*)')
+        clauses.append(name_q)
     if panel_id:
         clauses.append(f"panel_id:{panel_id}")
     if inst:
@@ -901,7 +906,7 @@ OLLAMA_TOOLS = [
                     "directorate":  {"type": "string",  "description": "one of: BIO, CSE, ENG, GEO, MPS, SBE, EDU, TIP"},
                     "year":         {"type": "integer", "description": "received_year e.g. 2024"},
                     "status":       {"type": "string",  "description": "one of: awarded, declined, pending"},
-                    "pi_name":      {"type": "string",  "description": "PI full name for exact match e.g. 'Jane Smith'"},
+                    "pi_name":      {"type": "string",  "description": "PI name — full name e.g. 'Jane Smith' or last name only e.g. 'Smith'; searches lead PI and all co-PIs"},
                     "panel_id":     {"type": "string",  "description": "panel ID e.g. P260135"},
                     "inst":         {"type": "string",  "description": "institution name e.g. 'University of Michigan'"},
                     "extra_query":  {"type": "string",  "description": "raw Lucene clause appended with AND, for advanced use only"},
@@ -1134,7 +1139,7 @@ SOLR FILTERS (pass as separate arguments, never write Lucene syntax):
   status:      awarded | declined | pending
   year:        integer e.g. 2024
   panel_id:    e.g. P260135
-  pi_name:     exact full name e.g. "Jane Smith"
+  pi_name:     full name e.g. "Jane Smith" or last name only e.g. "Smith" (searches lead PI and co-PIs)
   keywords:    words to find in summary e.g. "quantum computing"
 
 SQLITE SQL EXAMPLES:
