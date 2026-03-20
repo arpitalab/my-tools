@@ -247,10 +247,48 @@ def _build_query(keywords: str = "", directorate: str = "", year: int = 0,
     return " AND ".join(clauses) if clauses else "*:*"
 
 
+_COLLAB_RE = re.compile(r'(?i)^collaborative\s+research\s*:\s*')
+
+
+def _collab_key(title: str) -> str:
+    return _COLLAB_RE.sub('', title or '').strip().lower()
+
+
+def _dedup_docs(docs: list[dict]) -> list[tuple[dict, int]]:
+    """Collapse collaborative proposal sets by title.
+
+    Returns list of (representative_doc, n_collab_parts).
+    When multiple docs share the same normalized title, keep the one with the
+    longest summary/description (most text); note the group size.
+    """
+    groups: dict[str, list[dict]] = {}
+    for doc in docs:
+        key = _collab_key(str(doc.get("title", "")))
+        groups.setdefault(key, []).append(doc)
+
+    result = []
+    for group in groups.values():
+        best = max(
+            group,
+            key=lambda d: len(str(d.get("summary", "") or "") + str(d.get("description", "") or ""))
+        )
+        result.append((best, len(group)))
+    return result
+
+
 def _fmt_docs(results, fields: str) -> str:
-    lines = [f"Found {results.hits:,} proposals (showing {len(list(results))}):\n"]
-    for doc in results:
-        lines.append(f"ID: {doc.get('id','?')}  |  {doc.get('title','(no title)')}")
+    docs = list(results)
+    deduped = _dedup_docs(docs)
+    collapsed = len(docs) - len(deduped)
+    header = f"Found {results.hits:,} proposals (showing {len(deduped)}"
+    if collapsed:
+        header += f"; collapsed {collapsed} collaborative partner copies"
+    header += "):\n"
+    lines = [header]
+    for doc, n_parts in deduped:
+        title = doc.get('title', '(no title)')
+        collab_note = f"  [collaborative ×{n_parts}]" if n_parts > 1 else ""
+        lines.append(f"ID: {doc.get('id','?')}  |  {title}{collab_note}")
         for f in fields.split(","):
             f = f.strip()
             if f not in ("id", "title") and f in doc:
@@ -448,23 +486,30 @@ def csv_to_panel_input(csv_path: str, id_column: str = "",
         except Exception as e:
             return f"SOLR error (check VPN): {e}"
 
-    # --- Build panel input text ---
-    blocks  = []
+    # --- Build panel input text (deduplicate collaborative proposals) ---
+    # Resolve docs in CSV order, then collapse by normalized title
+    ordered_docs = []
     missing = []
     for pid in ids:
         doc = fetched.get(pid)
         if not doc:
             missing.append(pid)
-            continue
-        title   = doc.get("title", f"Proposal {pid}").strip()
-        abstract = str(doc.get(text_field, "")).strip()
-        if not abstract:
+        elif str(doc.get(text_field, "")).strip():
+            ordered_docs.append(doc)
+        else:
             missing.append(pid)
-            continue
-        blocks.append(f"{title}\n{abstract}")
 
-    if not blocks:
+    if not ordered_docs:
         return f"No text retrieved for any of {len(ids)} IDs (check VPN / field name)."
+
+    deduped = _dedup_docs(ordered_docs)
+    collapsed = len(ordered_docs) - len(deduped)
+
+    blocks = []
+    for doc, _ in deduped:
+        title    = doc.get("title", "").strip()
+        abstract = str(doc.get(text_field, "")).strip()
+        blocks.append(f"{title}\n{abstract}")
 
     output_text = "\n---\n".join(blocks) + "\n---\n"
 
@@ -479,7 +524,8 @@ def csv_to_panel_input(csv_path: str, id_column: str = "",
     summary = (f"Wrote {len(blocks)} proposals to: {out_path}\n"
                f"  ID column : '{id_column}'\n"
                f"  Text field: '{text_field}'\n"
-               f"  Missing   : {len(missing)}"
+               + (f"  Collapsed : {collapsed} collaborative partner copies\n" if collapsed else "")
+               + f"  Missing   : {len(missing)}"
                + (f" ({', '.join(missing[:10])}{'…' if len(missing)>10 else ''})" if missing else ""))
     return summary
 
@@ -570,14 +616,31 @@ def semantic_search(query_text: str, top_n: int = 10,
                 if aid not in allowed:
                     sims[i] = -2.0
 
-        top_idx = np.argsort(sims)[::-1][:top_n]
+        # Over-fetch to survive collaborative deduplication
+        top_idx = np.argsort(sims)[::-1][:top_n * 4]
         top_ids = [ids[i] for i in top_idx]
         meta    = _fetch_award_rows(top_ids)
-        lines   = [f"Top {len(top_idx)} semantically similar awards:\n"]
-        for rank, i in enumerate(top_idx, 1):
+
+        seen_keys: set[str] = set()
+        results_out = []
+        for i in top_idx:
             aid = ids[i]
-            lines.append(f"[{rank}]  score={float(sims[i]):.3f}")
-            lines.append(_fmt_award(meta.get(aid, {"award_id": aid})))
+            row = meta.get(aid, {"award_id": aid, "title": ""})
+            key = _collab_key(row.get("title", ""))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            results_out.append((float(sims[i]), aid, row))
+            if len(results_out) >= top_n:
+                break
+
+        collapsed = len(top_idx) - len(results_out)
+        lines = [f"Top {len(results_out)} semantically similar awards"
+                 + (f" (collapsed {collapsed} collaborative copies)" if collapsed else "")
+                 + ":\n"]
+        for rank, (score, aid, row) in enumerate(results_out, 1):
+            lines.append(f"[{rank}]  score={score:.3f}")
+            lines.append(_fmt_award(row))
             lines.append("")
         return "\n".join(lines)
     except Exception as e:
@@ -631,14 +694,31 @@ def hybrid_search(query_text: str, top_n: int = 10,
                 if aid not in allowed:
                     combined[i] = -1.0
 
-        top_idx = np.argsort(combined)[::-1][:top_n]
+        # Over-fetch to survive collaborative deduplication
+        top_idx = np.argsort(combined)[::-1][:top_n * 4]
         top_ids = [emb_ids[i] for i in top_idx]
         meta    = _fetch_award_rows(top_ids)
-        lines   = [f"Top {len(top_idx)} awards (hybrid semantic+concept+BM25):\n"]
-        for rank, i in enumerate(top_idx, 1):
+
+        seen_keys: set[str] = set()
+        results_out = []
+        for i in top_idx:
             aid = emb_ids[i]
-            lines.append(f"[{rank}]  score={combined[i]:.3f}")
-            lines.append(_fmt_award(meta.get(aid, {"award_id": aid})))
+            row = meta.get(aid, {"award_id": aid, "title": ""})
+            key = _collab_key(row.get("title", ""))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            results_out.append((float(combined[i]), aid, row))
+            if len(results_out) >= top_n:
+                break
+
+        collapsed = len(top_idx) - len(results_out)
+        lines = [f"Top {len(results_out)} awards (hybrid semantic+concept+BM25)"
+                 + (f" (collapsed {collapsed} collaborative copies)" if collapsed else "")
+                 + ":\n"]
+        for rank, (score, aid, row) in enumerate(results_out, 1):
+            lines.append(f"[{rank}]  score={score:.3f}")
+            lines.append(_fmt_award(row))
             lines.append("")
         return "\n".join(lines)
     except Exception as e:

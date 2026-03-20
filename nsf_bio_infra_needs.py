@@ -219,6 +219,42 @@ def composite(row: pd.Series) -> float:
 # Data loading
 # ---------------------------------------------------------------------------
 
+_COLLAB_RE = re.compile(r'(?i)^collaborative\s+research\s*:\s*')
+
+
+def _collab_key(title: str) -> str:
+    """Normalize title for collaborative proposal deduplication."""
+    return _COLLAB_RE.sub('', title or '').strip().lower()
+
+
+def _dedup_collaborative(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse collaborative proposal sets (same title, different PI/institution).
+
+    NSF collaborative proposals share a title of the form
+    'Collaborative Research: <actual title>' across 2–10 partner sites.
+    Keep the partner with the longest abstract text (most complete),
+    record the group size in 'n_collab_parts'.
+    """
+    df = df.copy()
+    df["_title_key"] = df["title"].apply(_collab_key)
+    df["_text_len"]  = df["text"].str.len().fillna(0)
+
+    # Within each title group, keep the row with the most text
+    idx_keep = (df.groupby("_title_key")["_text_len"]
+                  .idxmax()
+                  .values)
+    group_sizes = df.groupby("_title_key")["_title_key"].transform("count")
+    df["n_collab_parts"] = group_sizes
+
+    before = len(df)
+    df = df.loc[idx_keep].drop(columns=["_title_key", "_text_len"]).reset_index(drop=True)
+    collapsed = before - len(df)
+    if collapsed:
+        print(f"Deduplicated {collapsed:,} collaborative proposal copies "
+              f"({before:,} → {len(df):,} unique projects)")
+    return df
+
+
 def load_proposals(db_path: Path) -> pd.DataFrame:
     """Load proposals from nsf_bio.db or nsf_awards.db (BIO only)."""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -263,6 +299,7 @@ def load_proposals(db_path: Path) -> pd.DataFrame:
 
     conn.close()
     print(f"Loaded {len(df):,} proposals from {db_path.name}")
+    df = _dedup_collaborative(df)
     return df
 
 
