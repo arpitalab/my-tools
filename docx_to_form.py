@@ -1,25 +1,29 @@
 """
 docx_to_form.py — Convert a DOCX instruction document into a self-contained HTML form.
 
-Uses docling to parse the DOCX → markdown, then a local Ollama model to generate
-the interactive HTML form.
+Extracts text from the DOCX with python-docx (clean, no unicode artifacts), then
+generates the form with either the Claude API or a local Ollama model.
 
 Usage:
-    python docx_to_form.py path/to/instructions.docx
+    python docx_to_form.py path/to/instructions.docx            # auto-detect backend
+    python docx_to_form.py path/to/instructions.docx --backend claude
+    python docx_to_form.py path/to/instructions.docx --backend ollama
     python docx_to_form.py path/to/instructions.docx --out my_form.html
     python docx_to_form.py path/to/instructions.docx --model llama3.1
 
+Backend selection (--backend auto, the default):
+    Uses Claude if ANTHROPIC_API_KEY is set, otherwise falls back to Ollama.
+
 Requirements:
-    pip install ollama docling
-    ollama pull llama3.1
+    pip install python-docx anthropic ollama
+    # For Ollama backend: ollama pull llama3.1
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
-
-import ollama
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -33,91 +37,63 @@ Rules for every form you generate:
 - All CSS and JavaScript must be inline — no external dependencies whatsoever
 - Match input types to content: text fields, textareas, radio buttons, checkboxes,
   dropdowns as appropriate
-- Where the document says "select appropriate option" or lists alternatives with OR/AND,
-  use radio buttons or a dropdown so the user picks one
-- For boilerplate paragraphs with variable parts (shown in brackets or described as
-  variable), render the full paragraph text in a textarea and make the variable
-  parts editable inline inputs or clearly marked [PLACEHOLDER] text
-- Live preview: update a readonly output textarea in real time as fields are filled
+- Where the document says "select appropriate option" or lists alternatives separated
+  by OR or AND, use radio buttons or a dropdown to choose between them
+- For boilerplate paragraphs with variable parts (shown in brackets, italics, or
+  described as variable / highlighted), render the full paragraph with the variable
+  parts as editable inline inputs or clearly marked [PLACEHOLDER] spans
+- Live preview: as the user fills in fields the assembled output text updates in
+  real time in a readonly textarea
 - One copy-to-clipboard button per output section
 - Clean, professional styling suitable for a US federal agency
-- The form must work completely offline"""
+- Must work completely offline — no CDN, no external fonts, no external scripts"""
 
 FORM_PROMPT = """Convert the following document into a self-contained interactive
 HTML form. The document contains instructions and boilerplate language for writing
-administrative notes. Build a form that:
+administrative notes.
 
-1. Has input fields for every variable piece of information
-2. Offers radio buttons or dropdowns wherever the document gives alternative options
-3. Assembles the final text in a live preview pane that updates as the user types
-4. Has a copy button for each output section
+Build a form that:
+1. Has an input field for every variable piece of information
+2. Uses radio buttons or dropdowns wherever the document gives alternative options
+3. Assembles the final text in a live-updating preview pane
+4. Has copy-to-clipboard buttons on each output section
 
-Output ONLY the complete HTML file. Do not explain anything.
+Output ONLY the raw HTML. Do not include any explanation or markdown.
 
 DOCUMENT:
 
-{markdown}"""
+{text}"""
 
 
 # ---------------------------------------------------------------------------
-# DOCX → markdown
+# DOCX → plain text  (python-docx — clean, no unicode artifacts)
 # ---------------------------------------------------------------------------
 
-def convert_docx(path: Path) -> str:
+def extract_text(path: Path) -> str:
     try:
-        from docling.document_converter import DocumentConverter
+        from docx import Document
     except ImportError:
-        print("Error: docling not installed. Run: pip install docling", file=sys.stderr)
+        print("Error: python-docx not installed. Run: pip install python-docx",
+              file=sys.stderr)
         sys.exit(1)
 
-    print(f"Converting {path.name} with docling …", file=sys.stderr)
-    result   = DocumentConverter().convert(str(path))
-    markdown = result.document.export_to_markdown()
-    print(f"  {len(markdown):,} chars of markdown", file=sys.stderr)
-    return markdown
+    print(f"Reading {path.name} …", file=sys.stderr)
+    doc   = Document(str(path))
+    paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    text  = "\n\n".join(paras)
+    print(f"  {len(paras)} paragraphs, {len(text):,} characters", file=sys.stderr)
+    return text
 
 
 # ---------------------------------------------------------------------------
-# Generate form via Ollama (streaming)
+# Backends
 # ---------------------------------------------------------------------------
 
-def generate_form(markdown: str, model: str) -> str:
-    print(f"Generating form with {model} (streaming) …", file=sys.stderr)
-    print("This may take several minutes for a large document.\n", file=sys.stderr)
-
-    parts: list[str] = []
-    in_html = False  # skip any preamble text before the HTML starts
-
-    stream = ollama.chat(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": FORM_PROMPT.format(markdown=markdown)},
-        ],
-        stream=True,
-        options={
-            "num_predict": 16384,   # generous output budget for a full HTML page
-            "temperature": 0.2,     # low temperature — we want deterministic HTML
-        },
-    )
-
-    for chunk in stream:
-        text = chunk["message"]["content"]
-        parts.append(text)
-
-        # Show a progress dot every ~200 chars so the user knows it's working
-        if sum(len(p) for p in parts) % 200 < len(text):
-            print(".", end="", flush=True)
-
-    print(file=sys.stderr)
-
-    html = "".join(parts).strip()
-
-    # Strip markdown code fences if the model added them despite instructions
+def _strip_fences(raw: str) -> str:
+    """Remove markdown code fences and trim to the DOCTYPE if present."""
+    html = raw.strip()
     if "```" in html:
-        lines   = html.splitlines()
-        kept    = []
-        in_fence = False
+        lines, kept, in_fence = html.splitlines(), [], False
         for line in lines:
             if line.strip().startswith("```"):
                 in_fence = not in_fence
@@ -125,12 +101,68 @@ def generate_form(markdown: str, model: str) -> str:
             if not in_fence:
                 kept.append(line)
         html = "\n".join(kept).strip()
-
-    # If the model prefixed with prose before the DOCTYPE, trim it
-    if "<!DOCTYPE" in html and not html.startswith("<!"):
+    if "<!DOCTYPE" in html and not html.lstrip().startswith("<!"):
         html = html[html.index("<!DOCTYPE"):]
-
     return html
+
+
+def generate_claude(text: str, model: str) -> str:
+    try:
+        import anthropic
+    except ImportError:
+        print("Error: anthropic not installed. Run: pip install anthropic",
+              file=sys.stderr)
+        sys.exit(1)
+
+    client = anthropic.Anthropic()
+    print(f"Generating form with Claude ({model}) …", file=sys.stderr)
+
+    parts: list[str] = []
+    with client.messages.stream(
+        model=model,
+        max_tokens=16000,
+        thinking={"type": "adaptive"},
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user",
+                   "content": FORM_PROMPT.format(text=text)}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            parts.append(chunk)
+            if sum(len(p) for p in parts) % 300 < len(chunk):
+                print(".", end="", flush=True)
+
+    print(file=sys.stderr)
+    return _strip_fences("".join(parts))
+
+
+def generate_ollama(text: str, model: str) -> str:
+    try:
+        import ollama
+    except ImportError:
+        print("Error: ollama not installed. Run: pip install ollama", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Generating form with Ollama ({model}) …", file=sys.stderr)
+    print("This may take several minutes.\n", file=sys.stderr)
+
+    parts: list[str] = []
+    stream = ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": FORM_PROMPT.format(text=text)},
+        ],
+        stream=True,
+        options={"num_predict": 16384, "temperature": 0.2},
+    )
+    for chunk in stream:
+        piece = chunk["message"]["content"]
+        parts.append(piece)
+        if sum(len(p) for p in parts) % 300 < len(piece):
+            print(".", end="", flush=True)
+
+    print(file=sys.stderr)
+    return _strip_fences("".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -139,13 +171,15 @@ def generate_form(markdown: str, model: str) -> str:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Convert a DOCX instruction document to an HTML form using Ollama"
+        description="Convert a DOCX instruction document to an HTML form"
     )
-    p.add_argument("docx",  help="Path to the DOCX file")
+    p.add_argument("docx", help="Path to the DOCX file")
     p.add_argument("--out", default="",
                    help="Output HTML path (default: <docx_stem>_form.html)")
-    p.add_argument("--model", default="llama3.1",
-                   help="Ollama model to use (default: llama3.1)")
+    p.add_argument("--backend", choices=["auto", "claude", "ollama"], default="auto",
+                   help="LLM backend (default: claude if ANTHROPIC_API_KEY set, else ollama)")
+    p.add_argument("--model", default="",
+                   help="Model override (default: claude-opus-4-6 or llama3.1)")
     args = p.parse_args()
 
     docx_path = Path(args.docx)
@@ -156,12 +190,24 @@ def main() -> None:
     out_path = (Path(args.out) if args.out
                 else docx_path.with_name(docx_path.stem + "_form.html"))
 
-    markdown = convert_docx(docx_path)
-    html     = generate_form(markdown, model=args.model)
+    # Resolve backend
+    backend = args.backend
+    if backend == "auto":
+        backend = "claude" if os.environ.get("ANTHROPIC_API_KEY") else "ollama"
+    print(f"Backend: {backend}", file=sys.stderr)
 
-    if not html.strip().startswith("<!"):
-        print("\nWarning: output does not look like HTML — saving anyway.", file=sys.stderr)
-        print("Try running again or use --model llama3.1:70b for better results.", file=sys.stderr)
+    text = extract_text(docx_path)
+
+    if backend == "claude":
+        model = args.model or "claude-opus-4-6"
+        html  = generate_claude(text, model)
+    else:
+        model = args.model or "llama3.1"
+        html  = generate_ollama(text, model)
+
+    if not html.lstrip().startswith("<!"):
+        print("\nWarning: output does not look like valid HTML — saving anyway.",
+              file=sys.stderr)
 
     out_path.write_text(html, encoding="utf-8")
     print(f"Saved: {out_path}", file=sys.stderr)
