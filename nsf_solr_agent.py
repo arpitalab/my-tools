@@ -1198,32 +1198,43 @@ def run_native(model: str, verbose: bool, outfile=None) -> None:
         history.append({"role": "user", "content": user_input})
         messages = [SYSTEM_MSG] + history[-30:]
 
-        tool_called = False
+        _TOOL_NAMES = {t["function"]["name"] for t in OLLAMA_TOOLS}
+
+        any_tool_called = False
+        pushbacks       = 0
+        MAX_PUSHBACKS   = 3
+
         for _ in range(16):
             resp    = ollama.chat(model=model, messages=messages, tools=OLLAMA_TOOLS)
             msg     = resp["message"]
             calls   = msg.get("tool_calls") or []
 
             if not calls:
-                # If the model skipped tools entirely, push back once
-                if not tool_called:
-                    messages.append(msg)
-                    messages.append({
-                        "role": "user",
-                        "content": (
+                content = msg.get("content", "")
+                if pushbacks < MAX_PUSHBACKS:
+                    # Detect if the model described a tool call instead of executing it
+                    mentioned = [n for n in _TOOL_NAMES if n in content]
+                    if mentioned:
+                        nudge = (
+                            f"You described calling '{mentioned[0]}' but did not execute "
+                            f"it. Do not narrate tool use — call the tool directly now."
+                        )
+                    else:
+                        nudge = (
                             "You must call a tool to answer this — do not use your "
                             "training data. Names, titles, and proposal details must "
-                            "come from the database. Please call the appropriate tool now."
-                        ),
-                    })
-                    tool_called = True   # only push back once
+                            "come from the database. Call the appropriate tool now."
+                        )
+                    messages.append(msg)
+                    messages.append({"role": "user", "content": nudge})
+                    pushbacks += 1
                     continue
-                answer = msg.get("content", "").strip()
+                answer = content.strip()
                 emit(f"\nAssistant: {answer}\n")
                 history.append({"role": "assistant", "content": answer})
                 break
 
-            tool_called = True
+            any_tool_called = True
             messages.append(msg)
             for tc in calls:
                 fn_info = tc.get("function", tc)
