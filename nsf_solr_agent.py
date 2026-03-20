@@ -1211,7 +1211,8 @@ def run_native(model: str, verbose: bool, outfile=None) -> None:
 
             if not calls:
                 content = msg.get("content", "")
-                if pushbacks < MAX_PUSHBACKS:
+                # Only push back if no tool has been called yet in this turn
+                if not any_tool_called and pushbacks < MAX_PUSHBACKS:
                     # Detect if the model described a tool call instead of executing it
                     mentioned = [n for n in _TOOL_NAMES if n in content]
                     if mentioned:
@@ -1229,6 +1230,7 @@ def run_native(model: str, verbose: bool, outfile=None) -> None:
                     messages.append({"role": "user", "content": nudge})
                     pushbacks += 1
                     continue
+                # Tool already ran, or max pushbacks reached — accept the answer
                 answer = content.strip()
                 emit(f"\nAssistant: {answer}\n")
                 history.append({"role": "assistant", "content": answer})
