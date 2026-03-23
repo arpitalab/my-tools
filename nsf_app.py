@@ -20,10 +20,17 @@ import pickle
 import sqlite3
 from collections import defaultdict
 
+import re
+
 import numpy as np
 import scipy.sparse as sp
 import streamlit as st
 import plotly.graph_objects as go
+try:
+    import pysolr as _pysolr
+    _PYSOLR_OK = True
+except ImportError:
+    _PYSOLR_OK = False
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -560,7 +567,8 @@ def main():
     # ── Page selector ────────────────────────────────────────────────────────
     page = st.sidebar.radio(
         "Page",
-        ["🔬 Proposal Matcher", "🧑‍⚖️ Panel Builder", "🔍 Reviewer Lookup", "📈 Portfolio"],
+        ["🔬 Proposal Matcher", "🧑‍⚖️ Panel Builder", "🔍 Reviewer Lookup",
+         "📈 Portfolio", "📋 SOLR Fetch"],
         label_visibility="collapsed",
     )
 
@@ -577,6 +585,10 @@ def main():
 
     if page == "📈 Portfolio":
         _render_portfolio_evolution()
+        return
+
+    if page == "📋 SOLR Fetch":
+        _render_solr_fetch()
         return
 
     st.title("🔬 NSF Proposal Matcher")
@@ -1690,6 +1702,243 @@ def _render_portfolio_evolution() -> None:
             "Flow width ∝ total awarded dollars. "
             "Hover over any flow for exact amounts and award counts."
         )
+
+
+# ---------------------------------------------------------------------------
+# SOLR Fetch — constants & helpers
+# ---------------------------------------------------------------------------
+
+_SOLR_URL     = "http://dis-checker-a01.ad.nsf.gov/solr/proposals/"
+_SOLR_TIMEOUT = 30
+
+# Ordered field list shown in the extractor multiselect
+_SOLR_FIELDS: list[tuple[str, str]] = [
+    ("id",               "Proposal ID"),
+    ("title",            "Title"),
+    ("pi_name",          "PI Name"),
+    ("pi_all",           "All PIs"),
+    ("inst",             "Institution"),
+    ("inst_state",       "State"),
+    ("pi_gender",        "PI Gender"),
+    ("directorate",      "Directorate"),
+    ("division",         "Division"),
+    ("managing_program", "Managing Program"),
+    ("status",           "Status"),
+    ("received_year",    "Year"),
+    ("received",         "Received Date"),
+    ("award_date",       "Award Date"),
+    ("award_amount",     "Award Amount ($)"),
+    ("requested_amount", "Requested Amount ($)"),
+    ("funding_program",  "Funding Program"),
+    ("panel_id",         "Panel ID"),
+    ("panel_name",       "Panel Name"),
+    ("summary",          "Summary"),
+    ("description",      "Description (narrative)"),
+    ("bio",              "PI Bio"),
+    ("data_management",  "Data Management Plan"),
+]
+
+_COLLAB_RE_APP = re.compile(r'(?i)^collaborative\s+research\s*:\s*')
+
+
+def _solr_client_app():
+    return _pysolr.Solr(_SOLR_URL, timeout=_SOLR_TIMEOUT)
+
+
+def _parse_proposal_ids(raw: str) -> list[str]:
+    """Accept newline- or comma-separated IDs; filter to digit-only strings."""
+    parts = re.split(r"[\n,]+", raw)
+    return [p.strip() for p in parts if re.fullmatch(r"\d+", p.strip())]
+
+
+def _solr_fetch_batched(ids: list[str], fields: str) -> tuple[list[dict], list[str]]:
+    """Fetch SOLR docs for *ids* in batches of 50.
+    Returns (docs_in_id_order, missing_ids)."""
+    fetched: dict[str, dict] = {}
+    client = _solr_client_app()
+    for i in range(0, len(ids), 50):
+        batch = ids[i : i + 50]
+        results = client.search(
+            "id:(" + " OR ".join(batch) + ")",
+            fl=fields,
+            rows=len(batch),
+        )
+        for doc in results:
+            fetched[str(doc.get("id", ""))] = doc
+    # preserve input order
+    docs    = [fetched[i] for i in ids if i in fetched]
+    missing = [i for i in ids if i not in fetched]
+    return docs, missing
+
+
+def _dedup_app(docs: list[dict], text_field: str) -> list[dict]:
+    """Collapse collaborative proposals that share the same normalised title."""
+    groups: dict[str, list[dict]] = {}
+    for doc in docs:
+        key = _COLLAB_RE_APP.sub("", str(doc.get("title", ""))).strip().lower()
+        groups.setdefault(key, []).append(doc)
+    result = []
+    for group in groups.values():
+        best = max(group, key=lambda d: len(str(d.get(text_field, ""))))
+        result.append(best)
+    return result
+
+
+def _render_solr_fetch() -> None:
+    st.title("📋 SOLR Fetch")
+    st.markdown(
+        "Pull proposal data directly from the NSF SOLR database by ID. "
+        "**Requires NSF VPN.**"
+    )
+
+    if not _PYSOLR_OK:
+        st.error("`pysolr` is not installed. Run: `pip install pysolr`")
+        return
+
+    tab_panel, tab_fields = st.tabs(
+        ["📄 Panel Input Builder", "🔎 Field Extractor"]
+    )
+
+    # ------------------------------------------------------------------
+    # Tab 1 — Panel Input Builder
+    # ------------------------------------------------------------------
+    with tab_panel:
+        st.markdown(
+            "Paste proposal IDs to fetch their summaries in the format "
+            "expected by **nsf_panel_builder**."
+        )
+        ids_raw = st.text_area(
+            "Proposal IDs (one per line or comma-separated)",
+            height=150,
+            placeholder="2412345\n2412346\n2412347",
+            key="panel_ids",
+        )
+        text_field = st.radio(
+            "Text field",
+            ["summary", "description"],
+            horizontal=True,
+            key="panel_text_field",
+        )
+        fetch_btn = st.button("Fetch & Build", type="primary", key="panel_fetch")
+
+        if fetch_btn:
+            ids = _parse_proposal_ids(ids_raw)
+            if not ids:
+                st.warning("No valid numeric proposal IDs found.")
+            else:
+                with st.spinner(f"Fetching {len(ids)} proposals from SOLR …"):
+                    try:
+                        docs, missing = _solr_fetch_batched(
+                            ids, f"id,title,{text_field}"
+                        )
+                    except Exception as e:
+                        st.error(f"SOLR error (check VPN): {e}")
+                        docs, missing = [], ids
+
+                if docs:
+                    deduped = _dedup_app(docs, text_field)
+                    collapsed = len(docs) - len(deduped)
+                    blocks = []
+                    for doc in deduped:
+                        title    = str(doc.get("title", "")).strip()
+                        abstract = str(doc.get(text_field, "")).strip()
+                        if abstract:
+                            blocks.append(f"{title}\n{abstract}")
+
+                    output_text = "\n---\n".join(blocks) + "\n---\n"
+
+                    st.success(
+                        f"Retrieved **{len(deduped)}** proposals"
+                        + (f" ({collapsed} collaborative duplicates collapsed)" if collapsed else "")
+                        + (f"  ·  **{len(missing)} not found**: {', '.join(missing)}" if missing else "")
+                    )
+                    st.text_area("Panel input (copy or download)", output_text, height=400)
+                    st.download_button(
+                        "⬇️ Download .txt",
+                        data=output_text,
+                        file_name="panel_input.txt",
+                        mime="text/plain",
+                    )
+                elif missing:
+                    st.error(f"None of the {len(ids)} IDs were found in SOLR (check VPN).")
+
+    # ------------------------------------------------------------------
+    # Tab 2 — Field Extractor
+    # ------------------------------------------------------------------
+    with tab_fields:
+        st.markdown(
+            "Fetch any combination of SOLR fields for one or more proposals. "
+            "Results can be downloaded as CSV."
+        )
+        ids_raw2 = st.text_area(
+            "Proposal IDs (one per line or comma-separated)",
+            height=150,
+            placeholder="2412345\n2412346",
+            key="field_ids",
+        )
+
+        field_labels  = [label for _, label in _SOLR_FIELDS]
+        field_keys    = [key   for key, _   in _SOLR_FIELDS]
+        default_keys  = {"id", "title", "pi_name", "inst", "directorate",
+                         "status", "received_year", "award_amount"}
+        default_idx   = [i for i, k in enumerate(field_keys) if k in default_keys]
+
+        selected_idx = st.multiselect(
+            "Fields to extract",
+            options=list(range(len(_SOLR_FIELDS))),
+            default=default_idx,
+            format_func=lambda i: f"{field_keys[i]}  —  {field_labels[i]}",
+            key="field_select",
+        )
+
+        fetch_btn2 = st.button("Fetch Fields", type="primary", key="field_fetch")
+
+        if fetch_btn2:
+            ids2 = _parse_proposal_ids(ids_raw2)
+            if not ids2:
+                st.warning("No valid numeric proposal IDs found.")
+            elif not selected_idx:
+                st.warning("Select at least one field.")
+            else:
+                chosen_keys = [field_keys[i] for i in selected_idx]
+                # always include id so we can match rows
+                fl_set = list(dict.fromkeys(["id"] + chosen_keys))
+                fl_str = ",".join(fl_set)
+
+                with st.spinner(f"Fetching {len(ids2)} proposals …"):
+                    try:
+                        docs2, missing2 = _solr_fetch_batched(ids2, fl_str)
+                    except Exception as e:
+                        st.error(f"SOLR error (check VPN): {e}")
+                        docs2, missing2 = [], ids2
+
+                if docs2:
+                    import pandas as pd
+                    rows_out = []
+                    for doc in docs2:
+                        row = {k: doc.get(k, "") for k in fl_set}
+                        # flatten list values (e.g. pi_all)
+                        for k, v in row.items():
+                            if isinstance(v, list):
+                                row[k] = "; ".join(str(x) for x in v)
+                        rows_out.append(row)
+
+                    df = pd.DataFrame(rows_out, columns=fl_set)
+
+                    if missing2:
+                        st.warning(f"{len(missing2)} IDs not found: {', '.join(missing2)}")
+                    st.success(f"Retrieved **{len(df)}** proposals.")
+                    st.dataframe(df, use_container_width=True)
+
+                    csv_bytes = df.to_csv(index=False).encode()
+                    st.download_button(
+                        "⬇️ Download CSV",
+                        data=csv_bytes,
+                        file_name="proposals.csv",
+                        mime="text/csv",
+                    )
+                elif missing2:
+                    st.error(f"None of the {len(ids2)} IDs were found in SOLR (check VPN).")
 
 
 if __name__ == "__main__":
