@@ -11,6 +11,13 @@ Usage:
     # optional: enforce a JSON schema (Ollama structured outputs)
     python pdf_batch_extract.py --instructions inst.md --schema schema.json ...
 
+    # AI Datasets screening: SOLR descriptions + rubric + solicitation + schema
+    python pdf_batch_extract.py solr_descriptions/descriptions \
+        --instructions _best-r05-rubric.md --context "desc-AI datasets.txt" \
+        --schema _best-r05-schema.json
+
+Re-running resumes: files that already have a .json are skipped (--force redoes them).
+
 Outputs: <out>/<pdf_stem>.json per PDF, <out>/all.jsonl combined, and
 <out>/<pdf_stem>.raw.txt for any PDF whose output could not be parsed.
 
@@ -21,6 +28,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -183,6 +191,9 @@ def main():
                     help="PDF/.txt files and/or directories (default: ./pdfs, searched recursively)")
     ap.add_argument("--instructions", default="instructions.md", help=".md file with the extraction instructions")
     ap.add_argument("--schema", help="optional JSON schema file to enforce output structure")
+    ap.add_argument("--context", nargs="+", default=[],
+                    help="extra reference files appended to the instructions (e.g. the solicitation)")
+    ap.add_argument("--force", action="store_true", help="redo files that already have a .json")
     ap.add_argument("--model", default="gemma4:26b", help="Ollama model tag (see `ollama list`)")
     ap.add_argument("--out", default="./output/pdf_json")
     ap.add_argument("--num-ctx", type=int, default=32768)
@@ -196,6 +207,8 @@ def main():
     THINK = args.think
 
     instructions = Path(args.instructions).read_text()
+    for c in args.context:
+        instructions += f"\n\n---\n\n## Reference: {Path(c).name}\n\n{Path(c).read_text()}"
     schema = json.loads(Path(args.schema).read_text()) if args.schema else None
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -203,23 +216,47 @@ def main():
     pdfs = collect_pdfs(args.pdfs)
     if not pdfs:
         sys.exit(f"no .pdf or .txt files found in {args.pdfs}")
-    ok = 0
+    ok = failed = skipped = 0
+    t_start = time.time()
+    for i, pdf in enumerate(pdfs, 1):
+        dest = out / f"{pdf.stem}.json"
+        if dest.exists() and not args.force:  # resume: already done
+            skipped += 1
+            continue
+        done_new = ok + failed
+        eta = ""
+        if done_new:
+            per = (time.time() - t_start) / done_new
+            eta = f"  (~{per:.0f}s each, ~{per * (len(pdfs) - i + 1) / 3600:.1f}h left)"
+        print(f"[{i}/{len(pdfs)}] {pdf.name}{eta}")
+        try:
+            result, raw = process_pdf(pdf, instructions, schema, args)
+        except KeyboardInterrupt:
+            print("\ninterrupted; re-run to resume")
+            break
+        except Exception as e:  # keep going on bad files
+            print(f"    ! failed: {e}", file=sys.stderr)
+            failed += 1
+            continue
+        if result is None:
+            (out / f"{pdf.stem}.raw.txt").write_text(raw)
+            print(f"    ! gave up; raw output saved to {pdf.stem}.raw.txt", file=sys.stderr)
+            failed += 1
+            continue
+        dest.write_text(json.dumps({"file": pdf.name, **result}, indent=2))
+        (out / f"{pdf.stem}.raw.txt").unlink(missing_ok=True)
+        ok += 1
+
+    # rebuild all.jsonl from every per-file result (includes earlier runs)
+    n = 0
     with open(out / "all.jsonl", "w") as jl:
-        for i, pdf in enumerate(pdfs, 1):
-            print(f"[{i}/{len(pdfs)}] {pdf.name}")
-            try:
-                result, raw = process_pdf(pdf, instructions, schema, args)
-            except Exception as e:  # keep going on bad PDFs
-                print(f"    ! failed: {e}", file=sys.stderr)
-                continue
-            if result is None:
-                (out / f"{pdf.stem}.raw.txt").write_text(raw)
-                print(f"    ! gave up; raw output saved to {pdf.stem}.raw.txt", file=sys.stderr)
-                continue
-            (out / f"{pdf.stem}.json").write_text(json.dumps(result, indent=2))
-            jl.write(json.dumps({"file": pdf.name, **result}) + "\n")
-            ok += 1
-    print(f"done: {ok}/{len(pdfs)} succeeded -> {out}")
+        for f in sorted(out.glob("*.json")):
+            rec = json.loads(f.read_text())
+            rec.setdefault("file", f.stem)
+            jl.write(json.dumps(rec) + "\n")
+            n += 1
+    print(f"done: {ok} new, {skipped} already done, {failed} failed; "
+          f"{n} results in {out / 'all.jsonl'}")
 
 
 if __name__ == "__main__":
