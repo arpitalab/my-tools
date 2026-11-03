@@ -120,6 +120,84 @@ def parse_json(s: str):
 
 
 # --------------------------------------------------------------------------- #
+# Schema checking (in case Ollama doesn't enforce the schema, e.g. < 0.5)
+# --------------------------------------------------------------------------- #
+def _norm_key(k: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", k.lower())
+
+
+def repair_keys(obj, schema):
+    """Rename near-miss keys to the schema's names, in place.
+
+    A key not in the schema is renamed to a missing expected key when they share
+    a D-number prefix (D1_Program_Fit_and_Proposal_DType_... -> the D1 key) or
+    are identical after normalizing case and punctuation.
+    """
+    if not isinstance(obj, dict) or not isinstance(schema, dict):
+        return obj
+    props = schema.get("properties") or {}
+    if props:
+        for k in [k for k in obj if k not in props]:
+            missing = [e for e in props if e not in obj]
+            dk = re.match(r"(?i)(d\d+)(?:_|$)", k)
+            match = [e for e in missing if _norm_key(e) == _norm_key(k)]
+            if not match and dk:
+                match = [e for e in missing if re.match(rf"(?i){dk.group(1)}(?:_|$)", e)]
+            if len(match) == 1:
+                obj[match[0]] = obj.pop(k)
+        for k, sub in props.items():
+            if k in obj:
+                repair_keys(obj[k], sub)
+    if schema.get("type") == "array" and isinstance(obj, list):
+        for item in obj:
+            repair_keys(item, schema.get("items") or {})
+    return obj
+
+
+def schema_problems(obj, schema, path="") -> list[str]:
+    """Missing/unexpected keys, wrong types and out-of-range enum values."""
+    probs = []
+    t = schema.get("type")
+    where = path or "top level"
+    if "enum" in schema and obj not in schema["enum"]:
+        probs.append(f"{where}: {obj!r} not one of {schema['enum']}")
+    if t == "object":
+        if not isinstance(obj, dict):
+            return [f"{where}: expected an object"]
+        props = schema.get("properties") or {}
+        for k in schema.get("required", []):
+            if k not in obj:
+                probs.append(f"{where}: missing key \"{k}\"")
+        if props:
+            for k in obj:
+                if k not in props:
+                    probs.append(f"{where}: unexpected key \"{k}\"")
+        for k, sub in props.items():
+            if k in obj:
+                probs += schema_problems(obj[k], sub, f"{path}.{k}" if path else k)
+    elif t == "array":
+        if not isinstance(obj, list):
+            return [f"{where}: expected a list"]
+        for i, item in enumerate(obj):
+            probs += schema_problems(item, schema.get("items") or {}, f"{where}[{i}]")
+    elif t == "integer" and not (isinstance(obj, int) and not isinstance(obj, bool)):
+        probs.append(f"{where}: expected an integer")
+    elif t == "boolean" and not isinstance(obj, bool):
+        probs.append(f"{where}: expected true/false")
+    elif t == "string" and not isinstance(obj, str):
+        probs.append(f"{where}: expected a string")
+    return probs
+
+
+def ollama_version():
+    try:
+        v = requests.get(OLLAMA_URL.replace("/api/chat", "/api/version"), timeout=5).json()["version"]
+        return v, tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+    except Exception:
+        return None, None
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
 def summarize_chunks(model, chunks, args):
@@ -161,12 +239,12 @@ def process_pdf(pdf: Path, instructions: str, schema, args):
     ]
     fmt = schema if schema is not None else "json"
 
-    raw = ""
+    raw, last_ok = "", None
     for attempt in range(1, args.retries + 2):
         raw = chat(args.model, messages, num_ctx=args.num_ctx,
                    num_predict=args.num_predict, fmt=fmt)
         try:
-            return parse_json(raw), raw
+            result = parse_json(raw)
         except json.JSONDecodeError as e:
             print(f"    ! invalid JSON (attempt {attempt}): {e}", file=sys.stderr)
             messages += [
@@ -175,6 +253,27 @@ def process_pdf(pdf: Path, instructions: str, schema, args):
                     f"That was not valid JSON ({e}). Return the complete, valid JSON "
                     "object only. Keep string values concise.")},
             ]
+            continue
+        if schema is None:
+            return result, raw
+        repair_keys(result, schema)
+        probs = schema_problems(result, schema)
+        if not probs:
+            return result, raw
+        last_ok = result
+        print(f"    ! output doesn't match the schema (attempt {attempt}): "
+              f"{'; '.join(probs[:4])}{' ...' if len(probs) > 4 else ''}", file=sys.stderr)
+        messages += [
+            {"role": "assistant", "content": raw},
+            {"role": "user", "content": (
+                "That JSON doesn't match the required format:\n- " + "\n- ".join(probs[:15])
+                + "\nReturn the complete JSON object again using EXACTLY the key names and "
+                  "allowed values in the required output format.")},
+        ]
+    if last_ok is not None:
+        print("    ! saving the last reply anyway even though it doesn't fully match the "
+              "schema; check this proposal by hand", file=sys.stderr)
+        return last_ok, raw
     return None, raw
 
 
@@ -211,6 +310,17 @@ def main():
     for c in args.context:
         instructions += f"\n\n---\n\n## Reference: {Path(c).name}\n\n{Path(c).read_text()}"
     schema = json.loads(Path(args.schema).read_text()) if args.schema else None
+    ver, ver_t = ollama_version()
+    if ver is None:
+        print(f"! can't reach Ollama at {OLLAMA_URL}; is it running?", file=sys.stderr)
+    else:
+        print(f"Ollama {ver}, model {args.model}" + (f", schema {args.schema}" if schema else ""))
+        if schema is not None and ver_t < (0, 5, 0):
+            print("! this Ollama is older than 0.5 and won't enforce --schema; the script will "
+                  "still check each reply and retry, but upgrading Ollama is more reliable",
+                  file=sys.stderr)
+    if schema is None:
+        print("! no --schema given: the model may invent or misspell field names", file=sys.stderr)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
