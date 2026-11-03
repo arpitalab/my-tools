@@ -33,6 +33,8 @@ THINK = False  # set by --think
 # PDF text extraction
 # --------------------------------------------------------------------------- #
 def extract_text(pdf_path: Path) -> str:
+    if pdf_path.suffix.lower() in (".txt", ".md"):  # e.g. solr_fetch_descriptions.py output
+        return pdf_path.read_text(errors="replace")
     try:
         import fitz  # pymupdf
 
@@ -170,14 +172,15 @@ def process_pdf(pdf: Path, instructions: str, schema, args):
 def collect_pdfs(paths):
     out = []
     for p in map(Path, paths):
-        out += sorted(p.rglob("*.pdf")) if p.is_dir() else [p]
+        out += (sorted(f for f in p.rglob("*") if f.suffix.lower() in (".pdf", ".txt"))
+                if p.is_dir() else [p])
     return out
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pdfs", nargs="*", default=["pdfs"],
-                    help="PDF files and/or directories (default: ./pdfs, searched recursively)")
+                    help="PDF/.txt files and/or directories (default: ./pdfs, searched recursively)")
     ap.add_argument("--instructions", default="instructions.md", help=".md file with the extraction instructions")
     ap.add_argument("--schema", help="optional JSON schema file to enforce output structure")
     ap.add_argument("--model", default="gemma4:26b", help="Ollama model tag (see `ollama list`)")
@@ -199,7 +202,7 @@ def main():
 
     pdfs = collect_pdfs(args.pdfs)
     if not pdfs:
-        sys.exit(f"no PDFs found in {args.pdfs}")
+        sys.exit(f"no .pdf or .txt files found in {args.pdfs}")
     ok = 0
     with open(out / "all.jsonl", "w") as jl:
         for i, pdf in enumerate(pdfs, 1):
