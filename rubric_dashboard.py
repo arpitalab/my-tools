@@ -149,6 +149,35 @@ def load_titles(desc_dir: str, mtime: float) -> dict:
 
 
 @st.cache_data(show_spinner=False)
+def load_ffrdc_table(path: str, mtime: float):
+    """[(canonical name, sponsor, [regex, ...])] from ffrdc_list.csv."""
+    t = pd.read_csv(path, dtype=str).fillna("")
+    table = []
+    for _, row in t.iterrows():
+        names = [row["ffrdc"]] + [a.strip() for a in row["aliases"].split(";") if a.strip()]
+        pats = []
+        for nm in names:
+            body = r"[\s\-]+".join(map(re.escape, nm.split()))
+            acronym = len(nm) <= 6 and nm.replace("-", "").isalnum() and nm.upper() == nm
+            pats.append(re.compile(rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])",
+                                   0 if acronym else re.IGNORECASE))
+        table.append((row["ffrdc"], row["sponsor"], pats))
+    return table
+
+
+def match_ffrdcs(entities, table):
+    """Split the model's named entities into (recognized FFRDCs, unrecognized names)."""
+    confirmed, unrecognized = [], []
+    for e in entities or []:
+        hits = [name for name, _, pats in table if any(p.search(str(e)) for p in pats)]
+        if hits:
+            confirmed += [h for h in hits if h not in confirmed]
+        else:
+            unrecognized.append(str(e).strip())
+    return confirmed, unrecognized
+
+
+@st.cache_data(show_spinner=False)
 def load_metadata(path: str, mtime: float) -> pd.DataFrame:
     p = Path(path)
     df = (pd.read_excel(p, header=None, dtype=str) if p.suffix.lower() in (".xlsx", ".xls")
@@ -269,6 +298,7 @@ def main():
         res_path = st.text_input("Results (all.jsonl)", defaults.results)
         desc_path = st.text_input("Descriptions folder (optional)", defaults.descriptions)
         meta_path = st.text_input("ID spreadsheet for PI/institution (optional)", defaults.metadata)
+        ffrdc_path = st.text_input("FFRDC list", str(Path(__file__).parent / "ffrdc_list.csv"))
 
     if not Path(res_path).is_file():
         st.error(f"Results file not found: `{res_path}`. Run pdf_batch_extract.py first, "
@@ -302,6 +332,21 @@ def main():
 
     has_flags = df["agency_level"].notna().any()
     has_ffrdc = df["ffrdc"].notna().any()
+
+    # FFRDC status comes from the table, not the model: the model only names
+    # organizations; anything not on ffrdc_list.csv is set aside for review.
+    have_table = bool(ffrdc_path) and Path(ffrdc_path).is_file()
+    df["ffrdc_named"] = df["ffrdc_entities"]
+    if have_table:
+        table = load_ffrdc_table(ffrdc_path, Path(ffrdc_path).stat().st_mtime)
+        split = df["ffrdc_named"].map(lambda ents: match_ffrdcs(ents, table))
+        df["ffrdc_entities"] = split.map(lambda t: t[0])
+        df["ffrdc_unrecognized"] = split.map(lambda t: t[1])
+        df["ffrdc"] = df["ffrdc_entities"].map(bool)
+    else:
+        df["ffrdc_unrecognized"] = [[] for _ in range(len(df))]
+        if has_ffrdc:
+            st.sidebar.warning("FFRDC list not found; showing the model's FFRDC calls unchecked.")
 
     # ---- filters ---------------------------------------------------------- #
     with st.sidebar:
@@ -383,6 +428,19 @@ def main():
                 st.dataframe(ff[["id", "title", "ffrdc_entities", "ffrdc_role", "overall", "ffrdc_just"]],
                              hide_index=True, use_container_width=True,
                              column_config={"ffrdc_just": st.column_config.TextColumn("why", width="large")})
+                if have_table:
+                    un = f[["id", "ffrdc_unrecognized"]].explode("ffrdc_unrecognized").dropna()
+                    if len(un):
+                        st.markdown(f"**Named by the model but not on the FFRDC list** "
+                                    f"({un['id'].nunique()} proposals, not counted above)")
+                        st.caption("Usually computing resources or programs such as NAIRR or state "
+                                   "supercomputing centers. If one really is an FFRDC, add it to "
+                                   "ffrdc_list.csv.")
+                        st.dataframe(un.groupby("ffrdc_unrecognized")["id"]
+                                     .agg(proposals="count", ids=lambda s: ", ".join(s))
+                                     .sort_values("proposals", ascending=False).reset_index()
+                                     .rename(columns={"ffrdc_unrecognized": "name"}),
+                                     hide_index=True, use_container_width=True)
 
     # ---- Proposals -------------------------------------------------------- #
     with tabs[2]:
@@ -405,7 +463,7 @@ def main():
             st.dataframe(table, hide_index=True, use_container_width=True, column_config=cfg, height=420)
             sel_rows = []
         export = f.copy()
-        for c in ("agencies", "ffrdc_entities"):
+        for c in ("agencies", "ffrdc_entities", "ffrdc_named", "ffrdc_unrecognized"):
             export[c] = export[c].map(lambda v: "; ".join(v) if isinstance(v, list) else v)
         st.download_button("Download filtered results (CSV)", export.to_csv(index=False),
                            "rubric_results_filtered.csv", "text/csv")
@@ -436,6 +494,9 @@ def main():
                 if has_ffrdc:
                     ents = ", ".join(r["ffrdc_entities"]) if r["ffrdc_entities"] else "none"
                     st.markdown(f"**FFRDC:** {ents} ({r['ffrdc_role']}) — {r['ffrdc_just']}")
+                    if r["ffrdc_unrecognized"]:
+                        st.caption("Named by the model but not on the FFRDC list: "
+                                   + ", ".join(r["ffrdc_unrecognized"]))
 
     # ---- QA --------------------------------------------------------------- #
     with tabs[3]:
@@ -452,8 +513,6 @@ def main():
                     issues.append((r["id"], "missing score(s)"))
                 if has_flags and r["agency_level"] == "none" and r["agencies"]:
                     issues.append((r["id"], "agency level 'none' but agencies listed"))
-                if has_ffrdc and r["ffrdc"] is False and r["ffrdc_entities"]:
-                    issues.append((r["id"], "FFRDC 'not involved' but entities listed"))
         for _, r in df.iterrows():
             if r["nonstandard_keys"]:
                 issues.append((r["id"], "nonstandard dimension names (run without --schema, "
