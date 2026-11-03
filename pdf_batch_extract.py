@@ -1,0 +1,204 @@
+"""Batch PDF -> structured JSON via a local Ollama model.
+
+Each PDF is processed independently (one model call per PDF, never all PDFs in
+one prompt). Long PDFs are summarized chunk-by-chunk first, then the notes are
+converted to JSON following the instructions in an .md file.
+
+Usage:
+    python pdf_batch_extract.py --instructions gemma_instructions.md \
+        --model gemma4:26b --out ./output/pdf_json  a.pdf b.pdf dir_of_pdfs/
+
+    # optional: enforce a JSON schema (Ollama structured outputs)
+    python pdf_batch_extract.py --instructions inst.md --schema schema.json ...
+
+Outputs: <out>/<pdf_stem>.json per PDF, <out>/all.jsonl combined, and
+<out>/<pdf_stem>.raw.txt for any PDF whose output could not be parsed.
+
+Requires: pip install pymupdf   (or pypdf as a fallback)
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+import requests
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
+
+
+# --------------------------------------------------------------------------- #
+# PDF text extraction
+# --------------------------------------------------------------------------- #
+def extract_text(pdf_path: Path) -> str:
+    try:
+        import fitz  # pymupdf
+
+        with fitz.open(pdf_path) as doc:
+            return "\n".join(page.get_text() for page in doc)
+    except ImportError:
+        from pypdf import PdfReader
+
+        return "\n".join((p.extract_text() or "") for p in PdfReader(pdf_path).pages)
+
+
+def chunk_text(text: str, max_chars: int) -> list[str]:
+    """Split on paragraph boundaries into chunks of at most ~max_chars."""
+    paras = re.split(r"\n\s*\n", text)
+    chunks, cur = [], ""
+    for p in paras:
+        if len(cur) + len(p) + 2 > max_chars and cur:
+            chunks.append(cur)
+            cur = ""
+        while len(p) > max_chars:  # very long paragraph
+            chunks.append(p[:max_chars])
+            p = p[max_chars:]
+        cur += p + "\n\n"
+    if cur.strip():
+        chunks.append(cur)
+    return chunks
+
+
+# --------------------------------------------------------------------------- #
+# Ollama
+# --------------------------------------------------------------------------- #
+def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
+    body = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {"num_ctx": num_ctx, "num_predict": num_predict, "temperature": 0.0},
+    }
+    if fmt is not None:
+        body["format"] = fmt  # "json" or a JSON-schema dict
+    r = requests.post(OLLAMA_URL, json=body, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    content = data.get("message", {}).get("content", "")
+    if data.get("done_reason") == "length":
+        print("    ! output hit the token limit (truncated) — raise --num-predict/--num-ctx",
+              file=sys.stderr)
+    return content
+
+
+def parse_json(s: str):
+    """json.loads with light repair: strip fences, take outermost {...}."""
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    s2 = re.sub(r"^```(?:json)?\s*|\s*```$", "", s.strip())
+    start, end = s2.find("{"), s2.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(s2[start : end + 1])  # may still raise
+    raise json.JSONDecodeError("no JSON object found", s, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline
+# --------------------------------------------------------------------------- #
+def summarize_chunks(model, chunks, args):
+    notes = []
+    for i, ch in enumerate(chunks, 1):
+        print(f"    summarizing chunk {i}/{len(chunks)}")
+        notes.append(chat(
+            model,
+            [
+                {"role": "system", "content": (
+                    "You extract dense, factual notes from a section of a document. "
+                    "Keep all specifics (names, numbers, dates, methods, aims, results). "
+                    "Plain text bullet points, no JSON.")},
+                {"role": "user", "content": f"Section {i} of {len(chunks)}:\n\n{ch}"},
+            ],
+            num_ctx=args.num_ctx, num_predict=2048,
+        ))
+    return "\n\n".join(f"[Section {i}]\n{n}" for i, n in enumerate(notes, 1))
+
+
+def process_pdf(pdf: Path, instructions: str, schema, args):
+    text = extract_text(pdf)
+    if not text.strip():
+        raise ValueError("no extractable text (scanned PDF? needs OCR)")
+
+    # Direct pass if it fits, otherwise map-reduce into notes first.
+    if len(text) <= args.chunk_chars:
+        material, label = text, "DOCUMENT TEXT"
+    else:
+        chunks = chunk_text(text, args.chunk_chars)
+        material, label = summarize_chunks(args.model, chunks, args), "DOCUMENT NOTES"
+
+    messages = [
+        {"role": "system", "content": (
+            instructions
+            + "\n\nRespond ONLY with a single raw JSON object starting with '{'. "
+              "No markdown fences, no commentary.")},
+        {"role": "user", "content": f"{label} ({pdf.name}):\n\n{material}"},
+    ]
+    fmt = schema if schema is not None else "json"
+
+    raw = ""
+    for attempt in range(1, args.retries + 2):
+        raw = chat(args.model, messages, num_ctx=args.num_ctx,
+                   num_predict=args.num_predict, fmt=fmt)
+        try:
+            return parse_json(raw), raw
+        except json.JSONDecodeError as e:
+            print(f"    ! invalid JSON (attempt {attempt}): {e}", file=sys.stderr)
+            messages += [
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": (
+                    f"That was not valid JSON ({e}). Return the complete, valid JSON "
+                    "object only. Keep string values concise.")},
+            ]
+    return None, raw
+
+
+def collect_pdfs(paths):
+    out = []
+    for p in map(Path, paths):
+        out += sorted(p.glob("*.pdf")) if p.is_dir() else [p]
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("pdfs", nargs="+", help="PDF files and/or directories")
+    ap.add_argument("--instructions", default="instructions.md", help=".md file with the extraction instructions")
+    ap.add_argument("--schema", help="optional JSON schema file to enforce output structure")
+    ap.add_argument("--model", default="gemma4:26b", help="Ollama model tag (see `ollama list`)")
+    ap.add_argument("--out", default="./output/pdf_json")
+    ap.add_argument("--num-ctx", type=int, default=32768)
+    ap.add_argument("--num-predict", type=int, default=4096, help="max output tokens for the JSON")
+    ap.add_argument("--chunk-chars", type=int, default=60000,
+                    help="PDFs longer than this are summarized in chunks first (~4 chars/token)")
+    ap.add_argument("--retries", type=int, default=2)
+    args = ap.parse_args()
+
+    instructions = Path(args.instructions).read_text()
+    schema = json.loads(Path(args.schema).read_text()) if args.schema else None
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    pdfs = collect_pdfs(args.pdfs)
+    ok = 0
+    with open(out / "all.jsonl", "w") as jl:
+        for i, pdf in enumerate(pdfs, 1):
+            print(f"[{i}/{len(pdfs)}] {pdf.name}")
+            try:
+                result, raw = process_pdf(pdf, instructions, schema, args)
+            except Exception as e:  # keep going on bad PDFs
+                print(f"    ! failed: {e}", file=sys.stderr)
+                continue
+            if result is None:
+                (out / f"{pdf.stem}.raw.txt").write_text(raw)
+                print(f"    ! gave up; raw output saved to {pdf.stem}.raw.txt", file=sys.stderr)
+                continue
+            (out / f"{pdf.stem}.json").write_text(json.dumps(result, indent=2))
+            jl.write(json.dumps({"file": pdf.name, **result}) + "\n")
+            ok += 1
+    print(f"done: {ok}/{len(pdfs)} succeeded -> {out}")
+
+
+if __name__ == "__main__":
+    main()
