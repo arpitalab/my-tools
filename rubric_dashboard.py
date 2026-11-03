@@ -2,7 +2,7 @@
 
 Shows at-a-glance summary statistics for a few hundred scored proposals: score
 distributions per rubric dimension, proposal types, other-agency alignment and
-FFRDC flags, a filterable proposal table with drill-down, and QA checks on the
+FFRDC flags, a filterable proposal table with summary view, and QA checks on the
 model's output (gatekeeper-rule violations, failed files).
 
 Works with any rubric whose JSON has `dimension_scores` (D1_..., D2_...) and
@@ -395,39 +395,47 @@ def main():
         table = f[cols].sort_values("overall", ascending=False)
         cfg = {"overall": st.column_config.NumberColumn("overall", format="%d"),
                "title": st.column_config.TextColumn(width="large")}
-        st.dataframe(table, hide_index=True, use_container_width=True, column_config=cfg, height=420)
+        st.caption("Click a row to see its summary below.")
+        try:  # row selection needs streamlit >= 1.35
+            event = st.dataframe(table, hide_index=True, use_container_width=True, column_config=cfg,
+                                 height=420, on_select="rerun", selection_mode="single-row",
+                                 key="proposal_table")
+            sel_rows = list(event.selection.rows) if event is not None else []
+        except TypeError:
+            st.dataframe(table, hide_index=True, use_container_width=True, column_config=cfg, height=420)
+            sel_rows = []
         export = f.copy()
         for c in ("agencies", "ffrdc_entities"):
             export[c] = export[c].map(lambda v: "; ".join(v) if isinstance(v, list) else v)
         st.download_button("Download filtered results (CSV)", export.to_csv(index=False),
                            "rubric_results_filtered.csv", "text/csv")
 
-        st.subheader("Proposal detail")
+        st.subheader("Proposal summary")
         if len(table):
+            ids = table["id"].tolist()
             labels = {i: f"{i} · {t[:80]} (overall {o})"
                       for i, t, o in zip(table["id"], table["title"], table["overall"])}
-            pick = st.selectbox("Proposal", table["id"].tolist(), format_func=labels.get)
+            idx = sel_rows[0] if sel_rows and sel_rows[0] < len(ids) else 0
+            pick = st.selectbox("Proposal", ids, index=idx, format_func=labels.get)
             r = f.set_index("id").loc[pick]
             st.markdown(f"### {r['title'] or pick}")
             meta_line = " · ".join(str(r[c]) for c in extra_cols if pd.notna(r[c]))
-            st.caption(f"{pick} · {r['proposal_type']}" + (f" · {meta_line}" if meta_line else ""))
-            if r["summary"]:
-                st.write(r["summary"])
-            detail = pd.DataFrame(
-                [{"dimension": d, "score": r[d], "justification": r[d + "__just"]} for d in dims]
-                + [{"dimension": "Overall (0–5)", "score": r["overall"], "justification": r["overall_just"]}])
-            st.dataframe(detail, hide_index=True, use_container_width=True,
-                         column_config={"justification": st.column_config.TextColumn(width="large")})
-            if has_flags:
-                st.markdown(f"**Other-agency alignment:** {r['agency_level']} "
-                            f"{', '.join(r['agencies']) if r['agencies'] else ''} — {r['agency_just']}")
-            if has_ffrdc:
-                ents = ", ".join(r["ffrdc_entities"]) if r["ffrdc_entities"] else "none"
-                st.markdown(f"**FFRDC:** {ents} ({r['ffrdc_role']}) — {r['ffrdc_just']}")
-            txt = Path(desc_path) / f"{pick}.txt" if desc_path else None
-            if txt and txt.is_file():
-                with st.expander("Project description text"):
-                    st.text(txt.read_text(errors="replace"))
+            st.caption(f"{pick} · {r['proposal_type']} · overall {r['overall']}"
+                       + (f" · {meta_line}" if meta_line else ""))
+            st.write(r["summary"] or "_No summary in this result._")
+            with st.expander("Scores and justifications", expanded=False):
+                detail = pd.DataFrame(
+                    [{"dimension": d, "score": r[d], "justification": r[d + "__just"]} for d in dims]
+                    + [{"dimension": "Overall (0–5)", "score": r["overall"],
+                        "justification": r["overall_just"]}])
+                st.dataframe(detail, hide_index=True, use_container_width=True,
+                             column_config={"justification": st.column_config.TextColumn(width="large")})
+                if has_flags:
+                    st.markdown(f"**Other-agency alignment:** {r['agency_level']} "
+                                f"{', '.join(r['agencies']) if r['agencies'] else ''} — {r['agency_just']}")
+                if has_ffrdc:
+                    ents = ", ".join(r["ffrdc_entities"]) if r["ffrdc_entities"] else "none"
+                    st.markdown(f"**FFRDC:** {ents} ({r['ffrdc_role']}) — {r['ffrdc_just']}")
 
     # ---- QA --------------------------------------------------------------- #
     with tabs[3]:
