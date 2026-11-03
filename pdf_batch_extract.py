@@ -17,6 +17,7 @@ Usage:
         --schema _best-r05-schema.json
 
 Re-running resumes: files that already have a .json are skipped (--force redoes them).
+all.jsonl holds only the results for the files given in this run.
 
 Outputs: <out>/<pdf_stem>.json per PDF, <out>/all.jsonl combined, and
 <out>/<pdf_stem>.raw.txt for any PDF whose output could not be parsed.
@@ -247,16 +248,24 @@ def main():
         (out / f"{pdf.stem}.raw.txt").unlink(missing_ok=True)
         ok += 1
 
-    # rebuild all.jsonl from every per-file result (includes earlier runs)
+    # rebuild all.jsonl from the results for THIS run's input files only, so
+    # leftovers from earlier runs in the same --out folder don't mix in
     n = 0
+    wanted = {p.stem for p in pdfs}
     with open(out / "all.jsonl", "w") as jl:
-        for f in sorted(out.glob("*.json")):
-            rec = json.loads(f.read_text())
-            rec.setdefault("file", f.stem)
-            jl.write(json.dumps(rec) + "\n")
-            n += 1
+        for stem in sorted(wanted):
+            f = out / f"{stem}.json"
+            if f.exists():
+                rec = json.loads(f.read_text())
+                rec.setdefault("file", stem)
+                jl.write(json.dumps(rec) + "\n")
+                n += 1
+    others = sorted(f.name for f in out.glob("*.json") if f.stem not in wanted)
     print(f"done: {ok} new, {skipped} already done, {failed} failed; "
           f"{n} results in {out / 'all.jsonl'}")
+    if others:
+        print(f"note: {len(others)} other .json file(s) in {out} from earlier runs were left out "
+              f"of all.jsonl (e.g. {', '.join(others[:3])}). Use a separate --out per project.")
 
 
 if __name__ == "__main__":
