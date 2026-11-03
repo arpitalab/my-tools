@@ -20,6 +20,7 @@ import argparse
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -81,11 +82,29 @@ def load_results(path: str, mtime: float):
                 recs.append(json.loads(line))
             except json.JSONDecodeError:
                 pass
-    dim_keys = sorted({k for r in recs for k in (r.get("dimension_scores") or {})},
-                      key=lambda k: (_int(re.sub(r"\D", "", k.split("_")[0])) or 99, k))
+    # Group dimension keys by their D-number, so naming drift across results
+    # (e.g. runs without --schema, or an older rubric) can't create duplicate
+    # columns. Label each dimension with its most common key.
+    def dnum(k):
+        m = re.match(r"(?i)(D\d+)", k.strip())
+        return m.group(1).upper() if m else k.strip()
+
+    key_counts = Counter(k for r in recs for k in (r.get("dimension_scores") or {}))
+    canon = {}  # "D1" -> most common full key
+    for k, _ in key_counts.most_common():
+        canon.setdefault(dnum(k), k)
+    nums = sorted(canon, key=lambda n: (_int(n[1:]) if re.fullmatch(r"D\d+", n) else 99, n))
+    labels = {n: short_dim(canon[n]) if re.fullmatch(r"D\d+", n) else n for n in nums}
+    dims = list(dict.fromkeys(labels.values()))  # unique, in order
+
     rows = []
     for r in recs:
         pid = Path(str(r.get("file", ""))).stem
+        ds = r.get("dimension_scores") or {}
+        by_num = {}
+        for k, v in ds.items():
+            by_num.setdefault(dnum(k), v)
+        nonstd = sorted(k for k in ds if k != canon.get(dnum(k)))
         row = {
             "id": pid,
             "proposal_type": r.get("proposal_type") or "Unclear",
@@ -99,13 +118,17 @@ def load_results(path: str, mtime: float):
             "ffrdc_entities": _get(r, "ffrdc_involvement", "entities", default=[]) or [],
             "ffrdc_role": _get(r, "ffrdc_involvement", "role"),
             "ffrdc_just": _get(r, "ffrdc_involvement", "justification", default=""),
+            "nonstandard_keys": nonstd,
         }
-        for k in dim_keys:
-            row[short_dim(k)] = _int(_get(r, "dimension_scores", k, "score"))
-            row[short_dim(k) + "__just"] = _get(r, "dimension_scores", k, "justification", default="")
+        for n in nums:
+            v = by_num.get(n) if isinstance(by_num.get(n), dict) else {}
+            row[labels[n]] = _int(v.get("score"))
+            row[labels[n] + "__just"] = v.get("justification", "")
         rows.append(row)
     df = pd.DataFrame(rows)
-    return df, [short_dim(k) for k in dim_keys]
+    # same proposal scored twice (e.g. 123.txt and 123.pdf): keep the last
+    df = df.drop_duplicates("id", keep="last").reset_index(drop=True)
+    return df, dims
 
 
 @st.cache_data(show_spinner=False)
@@ -273,7 +296,7 @@ def main():
             inst_c = st.selectbox("Institution column", opts, index=guess(3), format_func=label)
             pi_c = st.selectbox("PI column", opts, index=guess(4), format_func=label)
         for name, c in (("institution", inst_c), ("PI", pi_c)):
-            if c != "(none)":
+            if c != "(none)" and name not in df.columns:
                 df = df.merge(meta[["id", c]].rename(columns={c: name}), on="id", how="left")
                 extra_cols.append(name)
 
@@ -368,6 +391,7 @@ def main():
             cols += ["agency_level", "agencies"]
         if has_ffrdc:
             cols += ["ffrdc_entities"]
+        cols = list(dict.fromkeys(c for c in cols if c in f.columns))
         table = f[cols].sort_values("overall", ascending=False)
         cfg = {"overall": st.column_config.NumberColumn("overall", format="%d"),
                "title": st.column_config.TextColumn(width="large")}
@@ -422,6 +446,10 @@ def main():
                     issues.append((r["id"], "agency level 'none' but agencies listed"))
                 if has_ffrdc and r["ffrdc"] is False and r["ffrdc_entities"]:
                     issues.append((r["id"], "FFRDC 'not involved' but entities listed"))
+        for _, r in df.iterrows():
+            if r["nonstandard_keys"]:
+                issues.append((r["id"], "nonstandard dimension names (run without --schema, "
+                                        "or older rubric?)", ", ".join(r["nonstandard_keys"])))
         failed = sorted(p.name.replace(".raw.txt", "") for p in Path(res_path).parent.glob("*.raw.txt"))
         for pid in failed:
             issues.append((pid, "model output could not be parsed (see .raw.txt)"))
@@ -431,7 +459,8 @@ def main():
             for pid in not_scored:
                 issues.append((pid, "description downloaded but not scored yet"))
         if issues:
-            qa = pd.DataFrame(issues, columns=["id", "issue"])
+            qa = pd.DataFrame([i if len(i) == 3 else (*i, "") for i in issues],
+                              columns=["id", "issue", "detail"])
             st.dataframe(qa.groupby("issue").size().rename("count").reset_index(),
                          hide_index=True, use_container_width=True)
             st.dataframe(qa, hide_index=True, use_container_width=True)
