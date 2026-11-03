@@ -130,8 +130,10 @@ def repair_keys(obj, schema):
     """Rename near-miss keys to the schema's names, in place.
 
     A key not in the schema is renamed to a missing expected key when they share
-    a D-number prefix (D1_Program_Fit_and_Proposal_DType_... -> the D1 key) or
-    are identical after normalizing case and punctuation.
+    a D-number prefix (D1_Program_Fit_and_Proposal_DType_... -> the D1 key), are
+    identical after normalizing case and punctuation, or when it is the only
+    unexpected key, exactly one required key is missing, and its value has that
+    key's required fields.
     """
     if not isinstance(obj, dict) or not isinstance(schema, dict):
         return obj
@@ -145,6 +147,16 @@ def repair_keys(obj, schema):
                 match = [e for e in missing if re.match(rf"(?i){dk.group(1)}(?:_|$)", e)]
             if len(match) == 1:
                 obj[match[0]] = obj.pop(k)
+        # one missing + one unexpected key with the right shape (e.g. the model
+        # wrote "scale": {"score":..,"justification":..} instead of the D4 key)
+        missing = [e for e in props if e not in obj and e in schema.get("required", [])]
+        extra = [k for k in obj if k not in props]
+        if len(missing) == 1 and len(extra) == 1:
+            want = props[missing[0]]
+            v = obj[extra[0]]
+            if want.get("type") == "object" and isinstance(v, dict) and \
+                    set(want.get("required", [])) <= set(v):
+                obj[missing[0]] = obj.pop(extra[0])
         for k, sub in props.items():
             if k in obj:
                 repair_keys(obj[k], sub)
