@@ -26,6 +26,7 @@ from pathlib import Path
 import requests
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
+THINK = False  # set by --think
 
 
 # --------------------------------------------------------------------------- #
@@ -69,16 +70,28 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
         "messages": messages,
         "stream": False,
         "options": {"num_ctx": num_ctx, "num_predict": num_predict, "temperature": 0.0},
+        # Gemma 4 is a thinking model; with thinking on, Ollama can route the
+        # whole reply into message.thinking and leave message.content empty.
+        "think": THINK,
     }
     if fmt is not None:
         body["format"] = fmt  # "json" or a JSON-schema dict
     r = requests.post(OLLAMA_URL, json=body, timeout=timeout)
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:300]}")
     data = r.json()
-    content = data.get("message", {}).get("content", "")
+    msg = data.get("message", {})
+    content = msg.get("content", "")
     if data.get("done_reason") == "length":
         print("    ! output hit the token limit (truncated) — raise --num-predict/--num-ctx",
               file=sys.stderr)
+    if not content.strip():
+        thinking = msg.get("thinking", "")
+        print(f"    ! empty content from model (done_reason={data.get('done_reason')!r}, "
+              f"thinking={len(thinking)} chars, eval_count={data.get('eval_count')})",
+              file=sys.stderr)
+        if thinking.strip():
+            content = thinking  # fall back; parse_json will pull out the {...}
     return content
 
 
@@ -157,13 +170,14 @@ def process_pdf(pdf: Path, instructions: str, schema, args):
 def collect_pdfs(paths):
     out = []
     for p in map(Path, paths):
-        out += sorted(p.glob("*.pdf")) if p.is_dir() else [p]
+        out += sorted(p.rglob("*.pdf")) if p.is_dir() else [p]
     return out
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("pdfs", nargs="+", help="PDF files and/or directories")
+    ap.add_argument("pdfs", nargs="*", default=["pdfs"],
+                    help="PDF files and/or directories (default: ./pdfs, searched recursively)")
     ap.add_argument("--instructions", default="instructions.md", help=".md file with the extraction instructions")
     ap.add_argument("--schema", help="optional JSON schema file to enforce output structure")
     ap.add_argument("--model", default="gemma4:26b", help="Ollama model tag (see `ollama list`)")
@@ -173,7 +187,10 @@ def main():
     ap.add_argument("--chunk-chars", type=int, default=60000,
                     help="PDFs longer than this are summarized in chunks first (~4 chars/token)")
     ap.add_argument("--retries", type=int, default=2)
+    ap.add_argument("--think", action="store_true", help="enable model thinking (off by default)")
     args = ap.parse_args()
+    global THINK
+    THINK = args.think
 
     instructions = Path(args.instructions).read_text()
     schema = json.loads(Path(args.schema).read_text()) if args.schema else None
@@ -181,6 +198,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     pdfs = collect_pdfs(args.pdfs)
+    if not pdfs:
+        sys.exit(f"no PDFs found in {args.pdfs}")
     ok = 0
     with open(out / "all.jsonl", "w") as jl:
         for i, pdf in enumerate(pdfs, 1):
