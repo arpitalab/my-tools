@@ -17,13 +17,22 @@ Usage:
 
 Re-running is safe: IDs already downloaded are skipped and failed/missing ones
 are retried, so an interrupted or timed-out run picks up where it left off
-(use --force to re-download everything).
+(use --force to re-download everything). IDs downloaded by an older version
+without PI/institution/amount get just that metadata filled in.
+
+Metadata (--meta-fields) is written to manifest.csv for rubric_dashboard.py.
+Defaults are the SOLR field names used in nsf_proposal_extract.py/solr_mcp.py;
+a field SOLR doesn't have is simply left blank. The concurrence check looks
+for the words "concurrence" / "concur" in the --concurrence-fields text (the
+uploaded Program Officer Concurrence Email should land there); it is a hint,
+not proof: verify in eJacket/Research.gov.
 
 Output (--out, default ./solr_descriptions):
     descriptions/<id>.txt     one per proposal, ready to score
     collaborative/<id>.txt    collaborative proposals, set aside (see --collab)
     collaborative_rwr.csv     collaborative proposals to consider returning without review
-    manifest.csv              id, title, status, chars, collaborative, collab group
+    manifest.csv              id, title, status, chars, collaborative, collab group, plus
+                              PI, institution, requested amount/months, concurrence check
     missing_ids.txt           IDs SOLR didn't return or that have no description
     meta.jsonl                per-ID fetch log (used for resume + dedup)
 """
@@ -41,6 +50,10 @@ import pysolr
 SOLR_BASE = "http://dis-checker-a01.ad.nsf.gov/solr"
 ID_RE = re.compile(r"^\d{7}$")
 _COLLAB_RE = re.compile(r"(?i)^collaborative\s+research\s*:\s*")  # same as nsf_solr_agent
+META_FIELDS = ("pi_name,inst,inst_state,requested_amount,rqst_mnth_cnt,lead_id,lead_proposal,"
+               "received,status,program_announcement,managing_program")
+RESERVED = {"id", "title", "status", "chars", "collaborative", "collab_group"}  # this script's own keys
+_CONCUR_RE = re.compile(r"(?i)\bconcur(rence|red|s)?\b")
 
 
 # --------------------------------------------------------------------------- #
@@ -101,6 +114,29 @@ def as_text(v) -> str:
     return "" if v is None else str(v)
 
 
+def flat(v) -> str:
+    """Short metadata value: lists joined with '; ', duplicates dropped."""
+    if isinstance(v, list):
+        return "; ".join(dict.fromkeys(str(x).strip() for x in v if str(x).strip()))
+    return "" if v is None else str(v).strip()
+
+
+def meta_key(field: str) -> str:
+    return f"solr_{field}" if field in RESERVED else field
+
+
+def meta_from_doc(d: dict, meta_fields: list[str], concur_fields: list[str]) -> dict:
+    # SOLR fields named like this script's own keys (e.g. SOLR's "status") get a solr_ prefix
+    m = {meta_key(f): flat(d.get(f)) for f in meta_fields}
+    if concur_fields:
+        present = [f for f in concur_fields if d.get(f) not in (None, "", [])]
+        text = " ".join(as_text(d.get(f)) for f in present)
+        # yes = the word appears; no = documents exist but no mention; "" = nothing to check
+        m["concurrence_found"] = ("yes" if _CONCUR_RE.search(text) else "no") if present else ""
+    m["meta_ok"] = True
+    return m
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -131,6 +167,10 @@ def main():
                     help="collaborative proposals: rwr = set every copy aside and list them as "
                          "return-without-review candidates (default; for solicitations that don't "
                          "allow collaboratives); dedup = score one copy per project; keep = score all")
+    ap.add_argument("--meta-fields", default=META_FIELDS,
+                    help="comma-separated SOLR metadata fields saved to manifest.csv")
+    ap.add_argument("--concurrence-fields", default="additional_documents,supplementary",
+                    help="SOLR text fields searched for the PO concurrence email ('' to skip)")
     ap.add_argument("--force", action="store_true", help="re-download IDs already fetched")
     args = ap.parse_args()
 
@@ -163,8 +203,15 @@ def main():
     print(f"{len(ids)} IDs; {len(ids) - len(todo)} already fetched; {len(todo)} to fetch "
           f"in batches of {args.batch_size}")
 
+    meta_fields = [x.strip() for x in args.meta_fields.split(",") if x.strip()]
+    concur_fields = [x.strip() for x in args.concurrence_fields.split(",") if x.strip()]
+    # downloaded by an older version: fetch only the metadata, not the description again
+    meta_todo = [i for i in ids if i not in todo and not meta[i].get("meta_ok")]
+    if meta_todo:
+        print(f"{len(meta_todo)} already-downloaded IDs need PI/institution/amount metadata")
+
     solr = pysolr.Solr(f"{SOLR_BASE}/{args.database}/", timeout=args.timeout)
-    fields = f"id,title,{args.field}"
+    fields = ",".join(dict.fromkeys(["id", "title", args.field] + meta_fields + concur_fields))
     n_batches = (len(todo) + args.batch_size - 1) // args.batch_size
 
     with open(meta_path, "a") as mf:
@@ -185,7 +232,8 @@ def main():
                     text = as_text(d.get(args.field)).strip()
                     title = as_text(d.get("title")).strip()
                     rec = {"id": pid, "title": title, "chars": len(text),
-                           "status": "ok" if text else "no_description"}
+                           "status": "ok" if text else "no_description",
+                           **meta_from_doc(d, meta_fields, concur_fields)}
                     if text:
                         (desc_dir / f"{pid}.txt").write_text(
                             f"Proposal {pid}: {title}\n\n{text}\n")
@@ -198,11 +246,37 @@ def main():
             if b + 1 < n_batches:
                 time.sleep(args.pause)
 
+        meta_only = ",".join(dict.fromkeys(["id"] + meta_fields + concur_fields))
+        for b in range(0, len(meta_todo), args.batch_size):
+            batch = meta_todo[b:b + args.batch_size]
+            try:
+                docs = fetch_batch(solr, batch, meta_only, args.retries, args.backoff)
+            except KeyboardInterrupt:
+                print("\ninterrupted; re-run to resume")
+                break
+            for d in docs:
+                pid = str(d.get("id"))
+                if pid in meta:
+                    meta[pid].update(meta_from_doc(d, meta_fields, concur_fields))
+                    mf.write(json.dumps(meta[pid]) + "\n")
+            mf.flush()
+            print(f"[metadata {b // args.batch_size + 1}/{(len(meta_todo) + args.batch_size - 1) // args.batch_size}] "
+                  f"{len(docs)}/{len(batch)}")
+
     # ---- collaborative proposals ------------------------------------------
     # Collaborative = title starts with "Collaborative Research:" (NSF's required
     # prefix for separately submitted collaboratives) or shares its normalized
     # title with another ID in this set.
     rows = [meta[i] for i in ids if i in meta]
+    # SOLR lead_id: a collaborative non-lead points at its lead's ID. Only trusted
+    # when it is a 7-digit ID different from the proposal's own.
+    lead_of = {r["id"]: r.get("lead_id", "").split(";")[0].strip() for r in rows}
+    lead_of = {i: l for i, l in lead_of.items() if ID_RE.match(l) and l != i}
+    leads = set(lead_of.values())
+    if rows and len(lead_of) > 0.5 * len(rows):
+        print(f"! warning: {len(lead_of)} of {len(rows)} proposals have a lead_id different from "
+              "their own ID; check whether SOLR's lead_id means what this script assumes",
+              file=sys.stderr)
     groups: dict[str, list[dict]] = {}
     for r in rows:
         if r["status"] == "ok":
@@ -213,12 +287,17 @@ def main():
         lead = max(g, key=lambda r: r["chars"])
         for r in g:
             prefixed = bool(_COLLAB_RE.match(r["title"]))
-            is_collab = prefixed or len(g) > 1
+            by_lead = r["id"] in lead_of or r["id"] in leads
+            is_collab = prefixed or len(g) > 1 or by_lead
             r["collaborative"] = "yes" if is_collab else ""
-            r["collab_group"] = lead["id"] if len(g) > 1 else ""
+            r["collab_group"] = (lead["id"] if len(g) > 1 else
+                                 lead_of.get(r["id"]) or (r["id"] if r["id"] in leads else ""))
             if is_collab:
                 reasons = (["'Collaborative Research:' title"] if prefixed else []) + \
-                          ([f"same title as {', '.join(x['id'] for x in g if x is not r)}"] if len(g) > 1 else [])
+                          ([f"same title as {', '.join(x['id'] for x in g if x is not r)}"] if len(g) > 1 else []) + \
+                          ([f"SOLR lead_id {lead_of[r['id']]}"] if r["id"] in lead_of else []) + \
+                          (["SOLR lead of " + ", ".join(i for i, l in lead_of.items() if l == r["id"])]
+                           if r["id"] in leads else [])
                 rwr.append({"id": r["id"], "title": r["title"], "collab_group": r["collab_group"],
                             "reason": "; ".join(reasons)})
             if args.collab == "keep" or not is_collab:
@@ -233,8 +312,10 @@ def main():
                     f.replace(dst / f.name)
 
     with open(out / "manifest.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["id", "title", "status", "chars", "collaborative", "collab_group"],
-                           extrasaction="ignore")
+        cols = ["id", "title", "status", "chars", "collaborative", "collab_group"] + \
+               [meta_key(c) for c in meta_fields if c not in ("id", "title")] + \
+               (["concurrence_found"] if concur_fields else [])
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", restval="")
         w.writeheader()
         for r in rows:
             w.writerow({"collaborative": "", "collab_group": "", **r})

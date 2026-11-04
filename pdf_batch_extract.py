@@ -157,6 +157,8 @@ def repair_keys(obj, schema):
             if want.get("type") == "object" and isinstance(v, dict) and \
                     set(want.get("required", [])) <= set(v):
                 obj[missing[0]] = obj.pop(extra[0])
+            elif "enum" in want and not isinstance(v, (dict, list)) and v in want["enum"]:
+                obj[missing[0]] = obj.pop(extra[0])  # e.g. "future_proposal": "clear"
         for k, sub in props.items():
             if k in obj:
                 repair_keys(obj[k], sub)

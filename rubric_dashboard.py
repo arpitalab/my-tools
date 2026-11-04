@@ -36,12 +36,19 @@ LEVEL_COLORS = {"none": "#a8a7a0", "partial": "#eda100", "strong": "#e34948"}
 TYPE_ORDER = ["Planning", "Impact/Flagship", "Unclear"]
 LEVEL_ORDER = ["none", "partial", "strong"]
 DIRECTORATES = ["BIO", "CISE", "EDU", "ENG", "GEO", "MPS", "SBE", "TIP"]
+PLAN_ORDER = ["planning-focused", "mixed", "mostly preliminary research"]
+PLAN_COLORS = {"planning-focused": "#a8a7a0", "mixed": "#eda100", "mostly preliminary research": "#e34948"}
+# Solicitation limits for Planning proposals (NSF 26-512)
+PLAN_MAX_DOLLARS = 200_000
+PLAN_MAX_MONTHS = 24
+PLAN_PREFIX_RE = re.compile(r"^\s*planning\s*:", re.I)        # declared Planning
+PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 
 
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-04 (domains + FFRDC table)"
+DASHBOARD_VERSION = "2026-11-04b (planning scope + compliance)"
 
 
 def newest_results(root="output"):
@@ -144,7 +151,13 @@ def load_results(path: str, mtime: float):
             "field": _get(r, "domain", "field", default="") or "",
             "domain_just": _get(r, "domain", "justification", default="") or "",
             "nonstandard_keys": nonstd,
+            "plan_level": _get(r, "planning_scope", "level"),
+            "plan_research": _get(r, "planning_scope", "research_activities", default=[]) or [],
+            "plan_path": _get(r, "planning_scope", "future_proposal_path"),
+            "plan_just": _get(r, "planning_scope", "justification", default="") or "",
         }
+        if row["plan_level"] == "not applicable":
+            row["plan_level"] = None
         sec = _get(r, "domain", "secondary_directorates", default=[]) or []
         row["secondary_dirs"] = list(dict.fromkeys(
             d for d in map(_clean_dir, sec if isinstance(sec, list) else [sec])
@@ -175,6 +188,35 @@ def load_titles(desc_dir: str, mtime: float) -> dict:
                 first = fh.readline().strip()
             titles[f.stem] = re.sub(r"^Proposal \d+:\s*", "", first)
     return titles
+
+
+def _money(v):
+    m = re.search(r"\d[\d,]*(\.\d+)?", str(v or ""))
+    return float(m.group(0).replace(",", "")) if m else None
+
+
+@st.cache_data(show_spinner=False)
+def load_manifest_meta(desc_dir: str, mtime: float) -> pd.DataFrame:
+    """PI / institution / requested amount / months / concurrence from manifest.csv."""
+    manifest = Path(desc_dir).parent / "manifest.csv"
+    if not manifest.exists():
+        return pd.DataFrame(columns=["id"])
+    m = pd.read_csv(manifest, dtype=str).fillna("")
+    out = pd.DataFrame({"id": m["id"]})
+    if "pi_name" in m:
+        out["PI"] = m["pi_name"]
+    if "inst" in m:
+        out["institution"] = m["inst"]
+    if "requested_amount" in m:
+        out["requested $"] = m["requested_amount"].map(_money)
+    if "rqst_mnth_cnt" in m:
+        out["months"] = m["rqst_mnth_cnt"].map(_money)
+    if "concurrence_found" in m:
+        out["concurrence_found"] = m["concurrence_found"]
+    # drop columns SOLR never filled
+    keep = ["id"] + [c for c in out.columns if c != "id"
+                     and out[c].replace("", pd.NA).notna().any()]
+    return out[keep]
 
 
 @st.cache_data(show_spinner=False)
@@ -346,6 +388,21 @@ def chart_pairs(df):
     return _layout(fig, height=80 + 28 * len(counts), title="Most common directorate combinations")
 
 
+def chart_planning(df):
+    counts = df["plan_level"].value_counts()
+    order = [p for p in PLAN_ORDER if p in counts]
+    if not order:
+        return None
+    n = int(counts[order].sum())
+    fig = go.Figure(go.Bar(
+        x=order, y=[int(counts[p]) for p in order], marker_color=[PLAN_COLORS[p] for p in order],
+        text=[int(counts[p]) for p in order], textposition="outside",
+        customdata=[f"{counts[p] / n:.0%}" for p in order],
+        hovertemplate="%{x}: %{y} proposals (%{customdata})<extra></extra>"))
+    fig.update_yaxes(title="Planning proposals")
+    return _layout(fig, title="Planning vs. preliminary research")
+
+
 def show(fig):
     if fig is not None:
         st.plotly_chart(fig, use_container_width=True, theme="streamlit")
@@ -385,6 +442,17 @@ def main():
     df.insert(1, "title", df["id"].map(titles).fillna(""))
 
     extra_cols = []
+    money_cols = []
+    if desc_path and Path(desc_path).is_dir():
+        mm = load_manifest_meta(desc_path, (Path(desc_path).parent / "manifest.csv").stat().st_mtime
+                                if (Path(desc_path).parent / "manifest.csv").exists() else 0)
+        if len(mm.columns) > 1:
+            df = df.merge(mm, on="id", how="left")
+            extra_cols += [c for c in ("PI", "institution") if c in mm.columns]
+            money_cols = [c for c in ("requested $", "months") if c in mm.columns]
+    if "concurrence_found" not in df.columns:
+        df["concurrence_found"] = ""
+    df["concurrence_found"] = df["concurrence_found"].fillna("")
     if meta_path and Path(meta_path).is_file():
         meta = load_metadata(meta_path, Path(meta_path).stat().st_mtime)
         sample = meta.iloc[0] if len(meta) else {}
@@ -402,6 +470,10 @@ def main():
     has_flags = df["agency_level"].notna().any()
     has_ffrdc = df["ffrdc"].notna().any()
     has_domain = df["primary_dir"].notna().any()
+    has_plan = df["plan_level"].notna().any()
+    df["declared"] = df["title"].map(lambda t: "Planning" if PLAN_PREFIX_RE.match(str(t))
+                                     else ("" if not str(t).strip() else "Impact/Flagship"))
+    df["is_planning"] = (df["declared"] == "Planning") | (df["proposal_type"] == "Planning")
     df["interdisciplinary"] = df["secondary_dirs"].map(bool) & df["primary_dir"].notna()
 
     # FFRDC status comes from the table, not the model: the model only names
@@ -428,6 +500,7 @@ def main():
         ffrdc_only = st.checkbox("Only proposals with FFRDC involvement") if has_ffrdc else False
         dir_pick = st.multiselect("Directorate (primary or secondary)", DIRECTORATES) if has_domain else []
         inter_only = st.checkbox("Only interdisciplinary proposals") if has_domain else False
+        plan_pick = st.multiselect("Planning scope", PLAN_ORDER) if has_plan else []
         query = st.text_input("Search title / summary / justifications")
 
     f = df[df["overall"].between(lo, hi) | df["overall"].isna() & (lo == 0)]
@@ -439,11 +512,13 @@ def main():
         f = f[f["primary_dir"].isin(dir_pick) | f["secondary_dirs"].map(lambda l: bool(set(l) & set(dir_pick)))]
     if inter_only:
         f = f[f["interdisciplinary"]]
+    if plan_pick:
+        f = f[f["plan_level"].isin(plan_pick)]
     if ffrdc_only:
         f = f[f["ffrdc"] == True]  # noqa: E712
     if query:
         text_cols = ["title", "summary", "overall_just", "agency_just", "ffrdc_just", "field",
-                     "domain_just"] + \
+                     "domain_just", "plan_just"] + \
                     [d + "__just" for d in dims] + extra_cols
         hay = f[text_cols].fillna("").astype(str).agg(" ".join, axis=1)
         f = f[hay.str.contains(query, case=False, regex=False)]
@@ -474,7 +549,7 @@ def main():
         k[5].metric("Interdisciplinary", f"{f['interdisciplinary'].sum()}",
                     f"{f['interdisciplinary'].sum() / n:.0%}", delta_color="off")
 
-    tabs = st.tabs(["Overview", "Domains", "Flags", "Proposals", "QA"])
+    tabs = st.tabs(["Overview", "Domains", "Flags", "Planning", "Proposals", "QA"])
 
     # ---- Overview --------------------------------------------------------- #
     with tabs[0]:
@@ -549,9 +624,76 @@ def main():
                                      .rename(columns={"ffrdc_unrecognized": "name"}),
                                      hide_index=True, use_container_width=True)
 
-    # ---- Proposals -------------------------------------------------------- #
+    # ---- Planning --------------------------------------------------------- #
     with tabs[3]:
-        cols = ["id", "title"] + extra_cols + ["proposal_type"]
+        p = f[f["is_planning"]]
+        st.caption(f"{len(p)} planning proposals in view (title starts with \"Planning:\" or the "
+                   "model judged the content to be Planning). Flags here are for review only; "
+                   "confirm each before returning a proposal without review.")
+        if not has_plan:
+            st.info("These results have no planning_scope field. Re-run with the r06 rubric and schema "
+                    "to see planning vs. preliminary research.")
+        else:
+            c1, c2 = st.columns([2, 3])
+            with c1:
+                show(chart_planning(p))
+            with c2:
+                path_counts = p["plan_path"].value_counts().reindex(["clear", "vague", "absent"], fill_value=0)
+                st.markdown("**Says what future Impact/Flagship proposal it prepares**")
+                st.dataframe(path_counts.rename_axis("future proposal path").reset_index(name="proposals"),
+                             hide_index=True, use_container_width=True)
+            concern = p[p["plan_level"].isin(["mostly preliminary research", "mixed"])].sort_values(
+                "plan_level", key=lambda s: s.map({"mostly preliminary research": 0, "mixed": 1}))
+            st.markdown(f"**{len(concern)} planning proposals with preliminary research** "
+                        "(\"mostly preliminary research\" = likely out of scope for Planning)")
+            st.dataframe(concern[["id", "title", "plan_level", "plan_research", "plan_path", "overall",
+                                  "plan_just"]],
+                         hide_index=True, use_container_width=True,
+                         column_config={"plan_just": st.column_config.TextColumn("why", width="large"),
+                                        "plan_research": st.column_config.ListColumn("research activities"),
+                                        "title": st.column_config.TextColumn(width="medium")})
+
+        st.subheader("Planning compliance checks")
+        checks = []
+        for _, r in f.iterrows():
+            t = str(r["title"])
+            if r["declared"] == "Planning" and r["proposal_type"] == "Impact/Flagship":
+                checks.append((r["id"], t, "title says Planning, content reads as Impact/Flagship", ""))
+            if r["declared"] == "Impact/Flagship" and r["proposal_type"] == "Planning":
+                checks.append((r["id"], t, "content reads as Planning, title has no \"Planning:\" prefix", ""))
+            if not r["is_planning"]:
+                continue
+            if r["declared"] == "Planning" and not PLAN_PREFIX_EXACT.match(t):
+                checks.append((r["id"], t, "title prefix is not exactly \"Planning: AIDatasets:\"", t[:40]))
+            amt = r.get("requested $")
+            if pd.notna(amt) and amt is not None and amt > PLAN_MAX_DOLLARS:
+                checks.append((r["id"], t, f"requests more than ${PLAN_MAX_DOLLARS:,}", f"${amt:,.0f}"))
+            mo = r.get("months")
+            if pd.notna(mo) and mo is not None and mo > PLAN_MAX_MONTHS:
+                checks.append((r["id"], t, f"longer than {PLAN_MAX_MONTHS} months", f"{mo:.0f} months"))
+            if r["concurrence_found"] == "no":
+                checks.append((r["id"], t, "no concurrence email found in SOLR documents (verify)", ""))
+            if r["plan_path"] == "absent":
+                checks.append((r["id"], t, "doesn't say what future proposal it prepares", ""))
+        if not money_cols:
+            st.caption("Budget and duration checks need manifest.csv from the updated "
+                       "solr_fetch_descriptions.py (re-run it; it only fills in the metadata).")
+        if checks:
+            ch = pd.DataFrame(checks, columns=["id", "title", "issue", "detail"])
+            st.dataframe(ch.groupby("issue").size().rename("count").reset_index(),
+                         hide_index=True, use_container_width=True)
+            st.dataframe(ch, hide_index=True, use_container_width=True,
+                         column_config={"title": st.column_config.TextColumn(width="large")})
+        else:
+            st.success("No planning compliance issues found.")
+        st.caption(f"Limits checked: ${PLAN_MAX_DOLLARS:,} total, {PLAN_MAX_MONTHS} months, title prefix, "
+                   "concurrence email. The 8-page limit isn't checked (SOLR text has no page count).")
+
+    # ---- Proposals -------------------------------------------------------- #
+    with tabs[4]:
+        cols = ["id", "title"] + extra_cols + money_cols + ["proposal_type"]
+        if has_plan:
+            cols += ["plan_level"]
         if has_domain:
             cols += ["primary_dir", "secondary_dirs", "field"]
         cols += ["overall"] + dims
@@ -562,6 +704,8 @@ def main():
         cols = list(dict.fromkeys(c for c in cols if c in f.columns))
         table = f[cols].sort_values("overall", ascending=False)
         cfg = {"overall": st.column_config.NumberColumn("overall", format="%d"),
+               "requested $": st.column_config.NumberColumn("requested $", format="$%d"),
+               "plan_level": st.column_config.TextColumn("planning scope"),
                "title": st.column_config.TextColumn(width="large")}
         st.caption("Click a row to see its summary below.")
         try:  # row selection needs streamlit >= 1.35
@@ -573,7 +717,8 @@ def main():
             st.dataframe(table, hide_index=True, use_container_width=True, column_config=cfg, height=420)
             sel_rows = []
         export = f.copy()
-        for c in ("agencies", "ffrdc_entities", "ffrdc_named", "ffrdc_unrecognized", "secondary_dirs"):
+        for c in ("agencies", "ffrdc_entities", "ffrdc_named", "ffrdc_unrecognized", "secondary_dirs",
+                  "plan_research"):
             export[c] = export[c].map(lambda v: "; ".join(v) if isinstance(v, list) else v)
         st.download_button("Download filtered results (CSV)", export.to_csv(index=False),
                            "rubric_results_filtered.csv", "text/csv")
@@ -607,6 +752,10 @@ def main():
                 if has_flags:
                     st.markdown(f"**Other-agency alignment:** {r['agency_level']} "
                                 f"{', '.join(r['agencies']) if r['agencies'] else ''} — {r['agency_just']}")
+                if has_plan and r["plan_level"]:
+                    acts = "; ".join(r["plan_research"]) if r["plan_research"] else ""
+                    st.markdown(f"**Planning scope:** {r['plan_level']} (future proposal path: "
+                                f"{r['plan_path']}) — {r['plan_just']}" + (f" Research: {acts}" if acts else ""))
                 if has_ffrdc:
                     ents = ", ".join(r["ffrdc_entities"]) if r["ffrdc_entities"] else "none"
                     st.markdown(f"**FFRDC:** {ents} ({r['ffrdc_role']}) — {r['ffrdc_just']}")
@@ -615,7 +764,7 @@ def main():
                                    + ", ".join(r["ffrdc_unrecognized"]))
 
     # ---- QA --------------------------------------------------------------- #
-    with tabs[4]:
+    with tabs[5]:
         rwr_file = Path(desc_path).parent / "collaborative_rwr.csv" if desc_path else None
         if rwr_file and rwr_file.is_file():
             rwr = pd.read_csv(rwr_file, dtype=str).fillna("")
