@@ -10,7 +10,7 @@ Works with any rubric whose JSON has `dimension_scores` (D1_..., D2_...) and
 
 Usage:
     streamlit run rubric_dashboard.py
-    streamlit run rubric_dashboard.py -- --results output/pdf_json/all.jsonl \
+    streamlit run rubric_dashboard.py -- --results output/ai_datasets/all.jsonl \
         --descriptions solr_descriptions/descriptions --metadata ids.xlsx
 
 All paths can also be changed in the sidebar.
@@ -41,12 +41,24 @@ DIRECTORATES = ["BIO", "CISE", "EDU", "ENG", "GEO", "MPS", "SBE", "TIP"]
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
+DASHBOARD_VERSION = "2026-11-04 (domains + FFRDC table)"
+
+
+def newest_results(root="output"):
+    """Most recently written all.jsonl under ./output (any subfolder)."""
+    found = sorted(Path(root).rglob("all.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True) \
+        if Path(root).is_dir() else []
+    return str(found[0]) if found else "output/ai_datasets/all.jsonl"
+
+
 def cli_defaults():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default="output/pdf_json/all.jsonl")
+    ap.add_argument("--results", default=None, help="default: newest output/**/all.jsonl")
     ap.add_argument("--descriptions", default="solr_descriptions/descriptions")
     ap.add_argument("--metadata", default="")
     args, _ = ap.parse_known_args(sys.argv[1:])
+    if args.results is None:
+        args.results = newest_results()
     return args
 
 
@@ -352,6 +364,10 @@ def main():
         desc_path = st.text_input("Descriptions folder (optional)", defaults.descriptions)
         meta_path = st.text_input("ID spreadsheet for PI/institution (optional)", defaults.metadata)
         ffrdc_path = st.text_input("FFRDC list", str(Path(__file__).parent / "ffrdc_list.csv"))
+        others = [str(p) for p in Path("output").rglob("all.jsonl")] if Path("output").is_dir() else []
+        if len(others) > 1:
+            st.caption("Other results files: " + ", ".join(f"`{o}`" for o in others if o != res_path))
+        st.caption(f"Dashboard version {DASHBOARD_VERSION}")
 
     if not Path(res_path).is_file():
         st.error(f"Results file not found: `{res_path}`. Run pdf_batch_extract.py first, "
@@ -433,7 +449,9 @@ def main():
         f = f[hay.str.contains(query, case=False, regex=False)]
 
     st.title("Proposal rubric dashboard")
-    st.caption(f"{len(f)} of {len(df)} proposals shown · `{res_path}`")
+    import datetime as _dt
+    updated = _dt.datetime.fromtimestamp(Path(res_path).stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    st.caption(f"{len(f)} of {len(df)} proposals shown · `{res_path}` (updated {updated})")
 
     # ---- KPI row ---------------------------------------------------------- #
     n = max(len(f), 1)
