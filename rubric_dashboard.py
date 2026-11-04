@@ -35,6 +35,7 @@ CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
 LEVEL_COLORS = {"none": "#a8a7a0", "partial": "#eda100", "strong": "#e34948"}
 TYPE_ORDER = ["Planning", "Impact/Flagship", "Unclear"]
 LEVEL_ORDER = ["none", "partial", "strong"]
+DIRECTORATES = ["BIO", "CISE", "EDU", "ENG", "GEO", "MPS", "SBE", "TIP"]
 
 
 # --------------------------------------------------------------------------- #
@@ -64,6 +65,14 @@ def _get(d, *path, default=None):
             return default
         d = d[p]
     return d
+
+
+def _clean_dir(v):
+    """'BIO' / 'bio' / 'BIO (Biological Sciences)' -> 'BIO'; None if empty."""
+    if not v:
+        return None
+    m = re.match(r"\s*([A-Za-z]+)", str(v))
+    return m.group(1).upper() if m else None
 
 
 def _int(v):
@@ -118,8 +127,16 @@ def load_results(path: str, mtime: float):
             "ffrdc_entities": _get(r, "ffrdc_involvement", "entities", default=[]) or [],
             "ffrdc_role": _get(r, "ffrdc_involvement", "role"),
             "ffrdc_just": _get(r, "ffrdc_involvement", "justification", default=""),
+            "primary_dir": _clean_dir(_get(r, "domain", "primary_directorate")),
+            "secondary_dirs": [],
+            "field": _get(r, "domain", "field", default="") or "",
+            "domain_just": _get(r, "domain", "justification", default="") or "",
             "nonstandard_keys": nonstd,
         }
+        sec = _get(r, "domain", "secondary_directorates", default=[]) or []
+        row["secondary_dirs"] = list(dict.fromkeys(
+            d for d in map(_clean_dir, sec if isinstance(sec, list) else [sec])
+            if d and d != row["primary_dir"]))
         for n in nums:
             v = by_num.get(n) if isinstance(by_num.get(n), dict) else {}
             row[labels[n]] = _int(v.get("score"))
@@ -281,6 +298,42 @@ def chart_ffrdc(df):
     return _layout(fig, height=80 + 26 * len(counts), title="FFRDCs named (top 15)")
 
 
+def chart_directorates(df):
+    prim = df["primary_dir"].value_counts()
+    sec = df["secondary_dirs"].explode().dropna().value_counts()
+    order = sorted(set(prim.index) | set(sec.index),
+                   key=lambda d: -(prim.get(d, 0) + sec.get(d, 0)))
+    if not order:
+        return None
+    order = order[::-1]  # largest at top of a horizontal chart
+    fig = go.Figure()
+    for name, counts, color in (("primary", prim, CATEGORICAL[0]), ("secondary", sec, CATEGORICAL[1])):
+        fig.add_trace(go.Bar(
+            y=order, x=[int(counts.get(d, 0)) for d in order], name=name, orientation="h",
+            marker_color=color, marker_line=dict(width=2, color="rgba(0,0,0,0)"),
+            hovertemplate="%{y} as " + name + ": %{x} proposals<extra></extra>"))
+    fig.update_layout(barmode="stack", legend=dict(title="Directorate is", orientation="h", y=1.12, x=0))
+    fig.update_xaxes(title="Proposals")
+    return _layout(fig, height=90 + 34 * len(order), title="Scientific domain by NSF directorate")
+
+
+def chart_pairs(df):
+    pairs = []
+    for p, secs in zip(df["primary_dir"], df["secondary_dirs"]):
+        for s2 in secs:
+            if p:
+                pairs.append(" + ".join(sorted((p, s2))))
+    if not pairs:
+        return None
+    counts = pd.Series(pairs).value_counts().head(12)[::-1]
+    fig = go.Figure(go.Bar(
+        y=counts.index, x=counts.values, orientation="h", marker_color=CATEGORICAL[2],
+        text=counts.values, textposition="outside",
+        hovertemplate="%{y}: %{x} proposals<extra></extra>"))
+    fig.update_xaxes(title="Proposals")
+    return _layout(fig, height=80 + 28 * len(counts), title="Most common directorate combinations")
+
+
 def show(fig):
     if fig is not None:
         st.plotly_chart(fig, use_container_width=True, theme="streamlit")
@@ -332,6 +385,8 @@ def main():
 
     has_flags = df["agency_level"].notna().any()
     has_ffrdc = df["ffrdc"].notna().any()
+    has_domain = df["primary_dir"].notna().any()
+    df["interdisciplinary"] = df["secondary_dirs"].map(bool) & df["primary_dir"].notna()
 
     # FFRDC status comes from the table, not the model: the model only names
     # organizations; anything not on ffrdc_list.csv is set aside for review.
@@ -355,6 +410,8 @@ def main():
         types = st.multiselect("Proposal type", sorted(df["proposal_type"].unique()))
         levels = st.multiselect("Other-agency alignment", LEVEL_ORDER) if has_flags else []
         ffrdc_only = st.checkbox("Only proposals with FFRDC involvement") if has_ffrdc else False
+        dir_pick = st.multiselect("Directorate (primary or secondary)", DIRECTORATES) if has_domain else []
+        inter_only = st.checkbox("Only interdisciplinary proposals") if has_domain else False
         query = st.text_input("Search title / summary / justifications")
 
     f = df[df["overall"].between(lo, hi) | df["overall"].isna() & (lo == 0)]
@@ -362,10 +419,15 @@ def main():
         f = f[f["proposal_type"].isin(types)]
     if levels:
         f = f[f["agency_level"].isin(levels)]
+    if dir_pick:
+        f = f[f["primary_dir"].isin(dir_pick) | f["secondary_dirs"].map(lambda l: bool(set(l) & set(dir_pick)))]
+    if inter_only:
+        f = f[f["interdisciplinary"]]
     if ffrdc_only:
         f = f[f["ffrdc"] == True]  # noqa: E712
     if query:
-        text_cols = ["title", "summary", "overall_just", "agency_just", "ffrdc_just"] + \
+        text_cols = ["title", "summary", "overall_just", "agency_just", "ffrdc_just", "field",
+                     "domain_just"] + \
                     [d + "__just" for d in dims] + extra_cols
         hay = f[text_cols].fillna("").astype(str).agg(" ".join, axis=1)
         f = f[hay.str.contains(query, case=False, regex=False)]
@@ -375,7 +437,7 @@ def main():
 
     # ---- KPI row ---------------------------------------------------------- #
     n = max(len(f), 1)
-    k = st.columns(6)
+    k = st.columns(7)
     k[0].metric("Proposals", len(f))
     k[1].metric("Mean overall", f"{f['overall'].mean():.2f}" if f["overall"].notna().any() else "–")
     k[2].metric("Highly relevant (≥4)", f"{(f['overall'] >= 4).sum()}",
@@ -387,10 +449,14 @@ def main():
         k[4].metric("Other agency: strong", f"{(f['agency_level'] == 'strong').sum()}",
                     f"+{(f['agency_level'] == 'partial').sum()} partial", delta_color="off")
     if has_ffrdc:
-        k[5].metric("FFRDC involved", f"{(f['ffrdc'] == True).sum()}",  # noqa: E712
+        k[6].metric("FFRDC involved", f"{(f['ffrdc'] == True).sum()}",  # noqa: E712
                     f"{(f['ffrdc'] == True).sum() / n:.0%}", delta_color="off")  # noqa: E712
 
-    tabs = st.tabs(["Overview", "Flags", "Proposals", "QA"])
+    if has_domain:
+        k[5].metric("Interdisciplinary", f"{f['interdisciplinary'].sum()}",
+                    f"{f['interdisciplinary'].sum() / n:.0%}", delta_color="off")
+
+    tabs = st.tabs(["Overview", "Domains", "Flags", "Proposals", "QA"])
 
     # ---- Overview --------------------------------------------------------- #
     with tabs[0]:
@@ -406,8 +472,31 @@ def main():
             means.insert(0, "n", f.groupby("proposal_type").size())
             st.dataframe(means, use_container_width=True)
 
-    # ---- Flags ------------------------------------------------------------ #
+    # ---- Domains ---------------------------------------------------------- #
     with tabs[1]:
+        if not has_domain:
+            st.info("These results have no domain fields. Re-run with the updated r05 rubric and schema.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                show(chart_directorates(f))
+            with c2:
+                show(chart_pairs(f))
+            st.subheader("Scores by primary directorate")
+            g = f[f["primary_dir"].notna()].groupby("primary_dir")
+            by_dir = g[["overall"] + dims].mean().round(2)
+            by_dir.insert(0, "interdisciplinary", (g["interdisciplinary"].mean() * 100).round().astype(int)
+                          .astype(str) + "%")
+            by_dir.insert(0, "n", g.size())
+            st.dataframe(by_dir.sort_values("n", ascending=False), use_container_width=True)
+            st.subheader("Most common fields")
+            fields = f["field"].str.strip().str.lower().replace("", pd.NA).dropna()
+            if len(fields):
+                st.dataframe(fields.value_counts().head(25).rename_axis("field").reset_index(name="proposals"),
+                             hide_index=True, use_container_width=True)
+
+    # ---- Flags ------------------------------------------------------------ #
+    with tabs[2]:
         if not (has_flags or has_ffrdc):
             st.info("These results have no agency/FFRDC fields. Re-run with the r05 rubric.")
         c1, c2 = st.columns(2)
@@ -443,8 +532,11 @@ def main():
                                      hide_index=True, use_container_width=True)
 
     # ---- Proposals -------------------------------------------------------- #
-    with tabs[2]:
-        cols = ["id", "title"] + extra_cols + ["proposal_type", "overall"] + dims
+    with tabs[3]:
+        cols = ["id", "title"] + extra_cols + ["proposal_type"]
+        if has_domain:
+            cols += ["primary_dir", "secondary_dirs", "field"]
+        cols += ["overall"] + dims
         if has_flags:
             cols += ["agency_level", "agencies"]
         if has_ffrdc:
@@ -463,7 +555,7 @@ def main():
             st.dataframe(table, hide_index=True, use_container_width=True, column_config=cfg, height=420)
             sel_rows = []
         export = f.copy()
-        for c in ("agencies", "ffrdc_entities", "ffrdc_named", "ffrdc_unrecognized"):
+        for c in ("agencies", "ffrdc_entities", "ffrdc_named", "ffrdc_unrecognized", "secondary_dirs"):
             export[c] = export[c].map(lambda v: "; ".join(v) if isinstance(v, list) else v)
         st.download_button("Download filtered results (CSV)", export.to_csv(index=False),
                            "rubric_results_filtered.csv", "text/csv")
@@ -478,7 +570,11 @@ def main():
             r = f.set_index("id").loc[pick]
             st.markdown(f"### {r['title'] or pick}")
             meta_line = " · ".join(str(r[c]) for c in extra_cols if pd.notna(r[c]))
-            st.caption(f"{pick} · {r['proposal_type']} · overall {r['overall']}"
+            dom = ""
+            if has_domain and r["primary_dir"]:
+                dom = " · " + " + ".join([r["primary_dir"]] + list(r["secondary_dirs"]))
+                dom += f" ({r['field']})" if r["field"] else ""
+            st.caption(f"{pick} · {r['proposal_type']} · overall {r['overall']}{dom}"
                        + (f" · {meta_line}" if meta_line else ""))
             st.write(r["summary"] or "_No summary in this result._")
             with st.expander("Scores and justifications", expanded=False):
@@ -488,6 +584,8 @@ def main():
                         "justification": r["overall_just"]}])
                 st.dataframe(detail, hide_index=True, use_container_width=True,
                              column_config={"justification": st.column_config.TextColumn(width="large")})
+                if has_domain and r["domain_just"]:
+                    st.markdown(f"**Domain:** {r['domain_just']}")
                 if has_flags:
                     st.markdown(f"**Other-agency alignment:** {r['agency_level']} "
                                 f"{', '.join(r['agencies']) if r['agencies'] else ''} — {r['agency_just']}")
@@ -499,7 +597,7 @@ def main():
                                    + ", ".join(r["ffrdc_unrecognized"]))
 
     # ---- QA --------------------------------------------------------------- #
-    with tabs[3]:
+    with tabs[4]:
         st.markdown("Checks on the model's output. Review these before relying on the numbers.")
         issues = []
         if dims:
@@ -509,6 +607,8 @@ def main():
                     issues.append((r["id"], "D1 = 0 but overall > 1 (gatekeeper rule)"))
                 if d2 and r[d2] == 0 and (r["overall"] or 0) > 2:
                     issues.append((r["id"], "D2 = 0 but overall > 2 (essential rule)"))
+                if has_domain and not r["primary_dir"]:
+                    issues.append((r["id"], "missing primary directorate"))
                 if any(pd.isna(r[d]) for d in dims) or pd.isna(r["overall"]):
                     issues.append((r["id"], "missing score(s)"))
                 if has_flags and r["agency_level"] == "none" and r["agencies"]:
