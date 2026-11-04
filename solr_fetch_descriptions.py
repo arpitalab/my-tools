@@ -20,9 +20,10 @@ are retried, so an interrupted or timed-out run picks up where it left off
 (use --force to re-download everything).
 
 Output (--out, default ./solr_descriptions):
-    descriptions/<id>.txt     one per proposal (lead copy of collaboratives)
-    collab_partners/<id>.txt  other institutions' copies of collaborative proposals
-    manifest.csv              id, title, status, chars, collab group
+    descriptions/<id>.txt     one per proposal, ready to score
+    collaborative/<id>.txt    collaborative proposals, set aside (see --collab)
+    collaborative_rwr.csv     collaborative proposals to consider returning without review
+    manifest.csv              id, title, status, chars, collaborative, collab group
     missing_ids.txt           IDs SOLR didn't return or that have no description
     meta.jsonl                per-ID fetch log (used for resume + dedup)
 """
@@ -126,7 +127,10 @@ def main():
     ap.add_argument("--retries", type=int, default=3)
     ap.add_argument("--backoff", type=float, default=10, help="first retry wait (s), doubles each time")
     ap.add_argument("--pause", type=float, default=1, help="seconds between batches")
-    ap.add_argument("--no-dedup", action="store_true", help="keep every collaborative copy in descriptions/")
+    ap.add_argument("--collab", choices=["rwr", "dedup", "keep"], default="rwr",
+                    help="collaborative proposals: rwr = set every copy aside and list them as "
+                         "return-without-review candidates (default; for solicitations that don't "
+                         "allow collaboratives); dedup = score one copy per project; keep = score all")
     ap.add_argument("--force", action="store_true", help="re-download IDs already fetched")
     args = ap.parse_args()
 
@@ -141,15 +145,20 @@ def main():
         sys.exit("no 7-digit proposal IDs found")
 
     out = Path(args.out)
-    desc_dir, partner_dir = out / "descriptions", out / "collab_partners"
+    desc_dir, collab_dir = out / "descriptions", out / "collaborative"
     desc_dir.mkdir(parents=True, exist_ok=True)
-    partner_dir.mkdir(exist_ok=True)
+    collab_dir.mkdir(exist_ok=True)
+    old_dir = out / "collab_partners"  # name used by earlier versions
+    if old_dir.is_dir():
+        for f in old_dir.glob("*.txt"):
+            f.replace(collab_dir / f.name)
+        old_dir.rmdir()
     meta_path = out / "meta.jsonl"
     meta = {} if args.force else load_meta(meta_path)
 
     # retry anything not yet fetched OK (incl. failed batches / not-yet-indexed),
     # and anything logged as OK whose .txt has since been deleted
-    have = lambda i: (desc_dir / f"{i}.txt").exists() or (partner_dir / f"{i}.txt").exists()
+    have = lambda i: (desc_dir / f"{i}.txt").exists() or (collab_dir / f"{i}.txt").exists()
     todo = [i for i in ids if meta.get(i, {}).get("status") != "ok" or not have(i)]
     print(f"{len(ids)} IDs; {len(ids) - len(todo)} already fetched; {len(todo)} to fetch "
           f"in batches of {args.batch_size}")
@@ -189,37 +198,62 @@ def main():
             if b + 1 < n_batches:
                 time.sleep(args.pause)
 
-    # ---- collaborative dedup: keep the longest copy per normalized title ----
+    # ---- collaborative proposals ------------------------------------------
+    # Collaborative = title starts with "Collaborative Research:" (NSF's required
+    # prefix for separately submitted collaboratives) or shares its normalized
+    # title with another ID in this set.
     rows = [meta[i] for i in ids if i in meta]
     groups: dict[str, list[dict]] = {}
     for r in rows:
         if r["status"] == "ok":
             key = _COLLAB_RE.sub("", r["title"]).strip().lower() or r["id"]
             groups.setdefault(key, []).append(r)
+    rwr = []
     for g in groups.values():
         lead = max(g, key=lambda r: r["chars"])
         for r in g:
+            prefixed = bool(_COLLAB_RE.match(r["title"]))
+            is_collab = prefixed or len(g) > 1
+            r["collaborative"] = "yes" if is_collab else ""
             r["collab_group"] = lead["id"] if len(g) > 1 else ""
-            primary = args.no_dedup or r is lead
-            src, dst = ((partner_dir, desc_dir) if primary else (desc_dir, partner_dir))
-            f = src / f"{r['id']}.txt"
-            if f.exists():
-                f.replace(dst / f.name)
+            if is_collab:
+                reasons = (["'Collaborative Research:' title"] if prefixed else []) + \
+                          ([f"same title as {', '.join(x['id'] for x in g if x is not r)}"] if len(g) > 1 else [])
+                rwr.append({"id": r["id"], "title": r["title"], "collab_group": r["collab_group"],
+                            "reason": "; ".join(reasons)})
+            if args.collab == "keep" or not is_collab:
+                dst = desc_dir
+            elif args.collab == "dedup":
+                dst = desc_dir if r is lead else collab_dir
+            else:  # rwr
+                dst = collab_dir
+            for src in (desc_dir, collab_dir):
+                f = src / f"{r['id']}.txt"
+                if f.exists() and src != dst:
+                    f.replace(dst / f.name)
 
     with open(out / "manifest.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["id", "title", "status", "chars", "collab_group"],
+        w = csv.DictWriter(f, fieldnames=["id", "title", "status", "chars", "collaborative", "collab_group"],
                            extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow({"collab_group": "", **r})
+            w.writerow({"collaborative": "", "collab_group": "", **r})
+    with open(out / "collaborative_rwr.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["id", "title", "collab_group", "reason"])
+        w.writeheader()
+        w.writerows(rwr)
 
     missing = [r["id"] for r in rows if r["status"] != "ok"]
     (out / "missing_ids.txt").write_text("\n".join(missing) + ("\n" if missing else ""))
     n_desc = len(list(desc_dir.glob("*.txt")))
-    n_partner = len(list(partner_dir.glob("*.txt")))
-    print(f"\ndone: {n_desc} descriptions in {desc_dir}"
-          + (f", {n_partner} collaborative partner copies set aside" if n_partner else "")
+    n_set_aside = len(list(collab_dir.glob("*.txt")))
+    print(f"\ndone: {n_desc} descriptions ready to score in {desc_dir}"
           + (f", {len(missing)} missing (see missing_ids.txt)" if missing else ""))
+    if rwr:
+        verb = {"rwr": "set aside, not scored", "dedup": "one copy per project kept for scoring",
+                "keep": "all kept for scoring"}[args.collab]
+        print(f"{len(rwr)} collaborative proposal(s) found ({verb}); "
+              f"listed in {out / 'collaborative_rwr.csv'}")
     not_run = len(ids) - len(rows)
     if not_run:
         print(f"{not_run} IDs not attempted yet; re-run to continue")

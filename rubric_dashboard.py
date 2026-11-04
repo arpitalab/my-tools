@@ -616,6 +616,16 @@ def main():
 
     # ---- QA --------------------------------------------------------------- #
     with tabs[4]:
+        rwr_file = Path(desc_path).parent / "collaborative_rwr.csv" if desc_path else None
+        if rwr_file and rwr_file.is_file():
+            rwr = pd.read_csv(rwr_file, dtype=str).fillna("")
+            if len(rwr):
+                st.subheader(f"Collaborative proposals: {len(rwr)} return-without-review candidates")
+                st.caption("Found by solr_fetch_descriptions.py and not scored (collaborative "
+                           "proposals aren't allowed in this solicitation). Confirm each before acting.")
+                st.dataframe(rwr, hide_index=True, use_container_width=True,
+                             column_config={"title": st.column_config.TextColumn(width="large")})
+        st.subheader("Output checks")
         st.markdown("Checks on the model's output. Review these before relying on the numbers.")
         issues = []
         if dims:
@@ -625,6 +635,9 @@ def main():
                     issues.append((r["id"], "D1 = 0 but overall > 1 (gatekeeper rule)"))
                 if d2 and r[d2] == 0 and (r["overall"] or 0) > 2:
                     issues.append((r["id"], "D2 = 0 but overall > 2 (essential rule)"))
+                if re.match(r"(?i)\s*collaborative\s+research\s*:", str(r["title"])):
+                    issues.append((r["id"], "scored, but title says Collaborative Research "
+                                            "(return-without-review candidate)"))
                 if has_domain and not r["primary_dir"]:
                     issues.append((r["id"], "missing primary directorate"))
                 if any(pd.isna(r[d]) for d in dims) or pd.isna(r["overall"]):
