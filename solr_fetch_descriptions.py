@@ -147,8 +147,10 @@ def main():
     meta_path = out / "meta.jsonl"
     meta = {} if args.force else load_meta(meta_path)
 
-    # retry anything not yet fetched OK (incl. failed batches / not-yet-indexed)
-    todo = [i for i in ids if meta.get(i, {}).get("status") != "ok"]
+    # retry anything not yet fetched OK (incl. failed batches / not-yet-indexed),
+    # and anything logged as OK whose .txt has since been deleted
+    have = lambda i: (desc_dir / f"{i}.txt").exists() or (partner_dir / f"{i}.txt").exists()
+    todo = [i for i in ids if meta.get(i, {}).get("status") != "ok" or not have(i)]
     print(f"{len(ids)} IDs; {len(ids) - len(todo)} already fetched; {len(todo)} to fetch "
           f"in batches of {args.batch_size}")
 
