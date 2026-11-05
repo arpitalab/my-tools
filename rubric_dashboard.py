@@ -20,7 +20,8 @@ import argparse
 import json
 import re
 import sys
-from collections import Counter
+import zlib
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -48,7 +49,7 @@ PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-06 (PDF descriptions)"
+DASHBOARD_VERSION = "2026-11-06b (duplicate check)"
 
 
 def newest_results(root="output"):
@@ -190,6 +191,55 @@ def load_titles(desc_dir: str, mtime: float) -> dict:
                 first = fh.readline().strip()
             titles[f.stem] = re.sub(r"^Proposal \d+:\s*", "", first)
     return titles
+
+
+@st.cache_data(show_spinner=False)
+def find_duplicates(desc_dir: str, ids: tuple, mtime: float, min_overlap: float = 0.5) -> pd.DataFrame:
+    """Pairs of proposals (different IDs) whose description texts largely
+    overlap: resubmissions, the same PDF filed under two IDs, etc. Compares
+    sampled 8-word shingles, so it ignores titles and formatting."""
+    sigs = {}
+    for pid in ids:
+        f = Path(desc_dir) / f"{pid}.txt"
+        if not f.is_file():
+            continue
+        body = f.read_text(errors="replace").split("\n", 1)[-1]  # skip "Proposal <id>: <title>"
+        w = re.findall(r"[a-z0-9]+", body.lower())
+        sh = {h for h in (zlib.crc32(" ".join(w[i:i + 8]).encode()) for i in range(len(w) - 7))
+              if h % 8 == 0}
+        if len(sh) >= 30:
+            sigs[pid] = sh
+    index = defaultdict(list)
+    for pid, sh in sigs.items():
+        for h in sh:
+            index[h].append(pid)
+    shared = Counter()
+    for pids in index.values():
+        if 1 < len(pids) <= 20:  # skip boilerplate many proposals share
+            for i, a in enumerate(pids):
+                for b in pids[i + 1:]:
+                    shared[(a, b) if a < b else (b, a)] += 1
+    rows = []
+    for (a, b), n in shared.items():
+        ov = n / min(len(sigs[a]), len(sigs[b]))
+        if ov >= min_overlap:
+            rows.append({"id_a": a, "id_b": b, "text overlap": round(100 * ov)})
+    return pd.DataFrame(rows, columns=["id_a", "id_b", "text overlap"])
+
+
+def duplicate_groups(pairs: pd.DataFrame) -> list[list[str]]:
+    parent = {}
+    def root(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            x = parent[x]
+        return x
+    for a, b in zip(pairs["id_a"], pairs["id_b"]):
+        parent[root(a)] = root(b)
+    groups = defaultdict(list)
+    for x in parent:
+        groups[root(x)].append(x)
+    return [sorted(g) for g in groups.values()]
 
 
 def _money(v):
@@ -480,6 +530,22 @@ def main():
             if c != "(none)" and name not in df.columns:
                 df = df.merge(meta[["id", c]].rename(columns={c: name}), on="id", how="left")
                 extra_cols.append(name)
+
+    df_all = df.copy()
+    # same proposal under two IDs (resubmission, PDF filed twice, ...)
+    dup_pairs, dup_hidden = pd.DataFrame(columns=["id_a", "id_b", "text overlap"]), []
+    if desc_path and Path(desc_path).is_dir():
+        dup_pairs = find_duplicates(desc_path, tuple(sorted(df["id"])),
+                                    Path(desc_path).stat().st_mtime)
+    if len(dup_pairs):
+        groups = duplicate_groups(dup_pairs)
+        with st.sidebar:
+            hide = st.checkbox(f"Hide duplicate copies ({sum(len(g) - 1 for g in groups)})", value=True,
+                               help="Same description text under different proposal IDs. Keeps the "
+                                    "highest (newest) ID of each group; all are listed in the QA tab.")
+        if hide:
+            dup_hidden = [i for g in groups for i in g[:-1]]
+            df = df[~df["id"].isin(dup_hidden)].reset_index(drop=True)
 
     has_flags = df["agency_level"].notna().any()
     has_ffrdc = df["ffrdc"].notna().any()
@@ -790,6 +856,20 @@ def main():
                            "proposals aren't allowed in this solicitation). Confirm each before acting.")
                 st.dataframe(rwr, hide_index=True, use_container_width=True,
                              column_config={"title": st.column_config.TextColumn(width="large")})
+        if len(dup_pairs):
+            info = df_all.set_index("id")
+            show_cols = [c for c in ("title", "PI", "institution") if c in info.columns]
+            d = dup_pairs.copy()
+            for side in ("a", "b"):
+                for c in show_cols:
+                    d[f"{c}_{side}"] = d[f"id_{side}"].map(info[c])
+            st.subheader(f"Possible duplicates: {len(d)} pair(s) with largely the same description text")
+            st.caption("Different proposal IDs whose descriptions overlap heavily (resubmission, "
+                       "same PDF filed twice, ...). Check in eJacket which one is live. "
+                       + (f"Hidden from the other tabs: {', '.join(dup_hidden)} (sidebar checkbox)."
+                          if dup_hidden else "All copies are shown in the other tabs."))
+            st.dataframe(d.sort_values("text overlap", ascending=False), hide_index=True,
+                         use_container_width=True)
         st.subheader("Output checks")
         st.markdown("Checks on the model's output. Review these before relying on the numbers.")
         issues = []
@@ -822,7 +902,7 @@ def main():
             for _, r in pm[~pm["status"].isin(["ok", "has_solr_text"])].iterrows():
                 issues.append((r["id"] or "?", f"PDF not converted: {r['status']}", r["file"]))
         if desc_path and Path(desc_path).is_dir():
-            scored = set(df["id"])
+            scored = set(df_all["id"])
             not_scored = sorted(p.stem for p in Path(desc_path).glob("*.txt") if p.stem not in scored)
             for pid in not_scored:
                 issues.append((pid, "description downloaded but not scored yet"))
