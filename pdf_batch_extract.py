@@ -13,14 +13,24 @@ Usage:
 
     # AI Datasets screening: SOLR descriptions + rubric + solicitation + schema
     python pdf_batch_extract.py solr_descriptions/descriptions \
-        --instructions _best-r05-rubric.md --context "desc-AI datasets.txt" \
-        --schema _best-r05-schema.json
+        --instructions _best-r06-rubric.md --context "desc-AI datasets.txt" \
+        --schema _best-r06-schema.json
 
 Re-running resumes: files that already have a .json are skipped (--force redoes them).
 all.jsonl holds only the results for the files given in this run.
 
-Outputs: <out>/<pdf_stem>.json per PDF, <out>/all.jsonl combined, and
-<out>/<pdf_stem>.raw.txt for any PDF whose output could not be parsed.
+Large runs (e.g. 1,400 proposals): every proposal is its own model call. The
+script works through them in batches of --batch-size, refreshing all.jsonl and
+failed.txt after each batch, so the dashboard can follow progress during the
+run. --limit N stops after N new proposals (e.g. one session a night). If
+Ollama stops responding the script waits and retries, and stops after
+--max-consecutive-failures failures in a row so it doesn't burn through the queue.
+--workers N sends N proposals at once; only faster if Ollama is started with
+OLLAMA_NUM_PARALLEL>=N and the GPU has memory for N contexts.
+
+Outputs: <out>/<pdf_stem>.json per PDF, <out>/all.jsonl combined,
+<out>/<pdf_stem>.raw.txt for any PDF whose output could not be parsed, and
+<out>/failed.txt listing failures from the latest run.
 
 Requires: pip install pymupdf   (or pypdf as a fallback)
 """
@@ -29,13 +39,31 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 THINK = False  # set by --think
+WORKERS = 1    # set by --workers; >1 prefixes log lines with the proposal name
+_print_lock = threading.Lock()
+
+
+def warn(msg: str):
+    """Warning line; tagged with the proposal being processed when running in parallel."""
+    tag = f"[{threading.current_thread().name}] " if WORKERS > 1 else ""
+    with _print_lock:
+        print(f"{tag}{msg}", file=sys.stderr)
+
+
+def write_atomic(path: Path, text: str):
+    """Write via a temp file so a crash can't leave a truncated .json behind."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -87,20 +115,30 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
     }
     if fmt is not None:
         body["format"] = fmt  # "json" or a JSON-schema dict
-    r = requests.post(OLLAMA_URL, json=body, timeout=timeout)
+    waits = [30, 60, 120, 300]  # Ollama down/restarting or overloaded
+    for attempt in range(len(waits) + 1):
+        try:
+            r = requests.post(OLLAMA_URL, json=body, timeout=timeout)
+            if r.status_code not in (500, 502, 503) or attempt == len(waits):
+                break
+            problem = f"HTTP {r.status_code}: {r.text[:150]}"
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt == len(waits):
+                raise RuntimeError(f"Ollama not responding after {len(waits)} retries: {e}") from e
+            problem = f"{type(e).__name__}"
+        warn(f"    ! Ollama {problem}; retrying in {waits[attempt]}s")
+        time.sleep(waits[attempt])
     if not r.ok:
         raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:300]}")
     data = r.json()
     msg = data.get("message", {})
     content = msg.get("content", "")
     if data.get("done_reason") == "length":
-        print("    ! output hit the token limit (truncated) — raise --num-predict/--num-ctx",
-              file=sys.stderr)
+        warn("    ! output hit the token limit (truncated) — raise --num-predict/--num-ctx")
     if not content.strip():
         thinking = msg.get("thinking", "")
-        print(f"    ! empty content from model (done_reason={data.get('done_reason')!r}, "
-              f"thinking={len(thinking)} chars, eval_count={data.get('eval_count')})",
-              file=sys.stderr)
+        warn(f"    ! empty content from model (done_reason={data.get('done_reason')!r}, "
+             f"thinking={len(thinking)} chars, eval_count={data.get('eval_count')})")
         if thinking.strip():
             content = thinking  # fall back; parse_json will pull out the {...}
     return content
@@ -217,7 +255,7 @@ def ollama_version():
 def summarize_chunks(model, chunks, args):
     notes = []
     for i, ch in enumerate(chunks, 1):
-        print(f"    summarizing chunk {i}/{len(chunks)}")
+        warn(f"    summarizing chunk {i}/{len(chunks)} (long document)")
         notes.append(chat(
             model,
             [
@@ -260,7 +298,7 @@ def process_pdf(pdf: Path, instructions: str, schema, args):
         try:
             result = parse_json(raw)
         except json.JSONDecodeError as e:
-            print(f"    ! invalid JSON (attempt {attempt}): {e}", file=sys.stderr)
+            warn(f"    ! invalid JSON (attempt {attempt}): {e}")
             messages += [
                 {"role": "assistant", "content": raw},
                 {"role": "user", "content": (
@@ -275,8 +313,8 @@ def process_pdf(pdf: Path, instructions: str, schema, args):
         if not probs:
             return result, raw
         last_ok = result
-        print(f"    ! output doesn't match the schema (attempt {attempt}): "
-              f"{'; '.join(probs[:4])}{' ...' if len(probs) > 4 else ''}", file=sys.stderr)
+        warn(f"    ! output doesn't match the schema (attempt {attempt}): "
+             f"{'; '.join(probs[:4])}{' ...' if len(probs) > 4 else ''}")
         messages += [
             {"role": "assistant", "content": raw},
             {"role": "user", "content": (
@@ -285,8 +323,8 @@ def process_pdf(pdf: Path, instructions: str, schema, args):
                   "allowed values in the required output format.")},
         ]
     if last_ok is not None:
-        print("    ! saving the last reply anyway even though it doesn't fully match the "
-              "schema; check this proposal by hand", file=sys.stderr)
+        warn("    ! saving the last reply anyway even though it doesn't fully match the "
+             "schema; check this proposal by hand")
         return last_ok, raw
     return None, raw
 
@@ -316,9 +354,17 @@ def main():
                     help="PDFs longer than this are summarized in chunks first (~4 chars/token)")
     ap.add_argument("--retries", type=int, default=2)
     ap.add_argument("--think", action="store_true", help="enable model thinking (off by default)")
+    ap.add_argument("--batch-size", type=int, default=25,
+                    help="refresh all.jsonl and failed.txt after every N proposals")
+    ap.add_argument("--limit", type=int, default=0, help="stop after N new proposals (0 = all)")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="proposals sent to Ollama at once (needs OLLAMA_NUM_PARALLEL>=N)")
+    ap.add_argument("--max-consecutive-failures", type=int, default=5,
+                    help="stop the run after this many failures in a row (Ollama down?)")
     args = ap.parse_args()
-    global THINK
+    global THINK, WORKERS
     THINK = args.think
+    WORKERS = max(1, args.workers)
 
     instructions = Path(args.instructions).read_text()
     for c in args.context:
@@ -337,59 +383,106 @@ def main():
         print("! no --schema given: the model may invent or misspell field names", file=sys.stderr)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    for tmp in out.glob("*.json.tmp"):  # left by a crash mid-write
+        tmp.unlink()
 
     pdfs = collect_pdfs(args.pdfs)
     if not pdfs:
         sys.exit(f"no .pdf or .txt files found in {args.pdfs}")
-    ok = failed = skipped = 0
-    t_start = time.time()
-    for i, pdf in enumerate(pdfs, 1):
-        dest = out / f"{pdf.stem}.json"
-        if dest.exists() and not args.force:  # resume: already done
-            skipped += 1
-            continue
-        done_new = ok + failed
-        eta = ""
-        if done_new:
-            per = (time.time() - t_start) / done_new
-            eta = f"  (~{per:.0f}s each, ~{per * (len(pdfs) - i + 1) / 3600:.1f}h left)"
-        print(f"[{i}/{len(pdfs)}] {pdf.name}{eta}")
+    wanted = {p.stem for p in pdfs}
+    def scored(p):  # a .json that won't parse (e.g. from an old crash) counts as not scored
         try:
-            result, raw = process_pdf(pdf, instructions, schema, args)
-        except KeyboardInterrupt:
-            print("\ninterrupted; re-run to resume")
-            break
-        except Exception as e:  # keep going on bad files
-            print(f"    ! failed: {e}", file=sys.stderr)
-            failed += 1
-            continue
+            json.loads((out / f"{p.stem}.json").read_text())
+            return True
+        except (OSError, json.JSONDecodeError):
+            return False
+
+    todo = [p for p in pdfs if args.force or not scored(p)]
+    skipped = len(pdfs) - len(todo)
+    if args.limit:
+        todo = todo[:args.limit]
+    n_batches = (len(todo) + args.batch_size - 1) // max(args.batch_size, 1)
+    print(f"{len(pdfs)} inputs: {skipped} already scored, {len(todo)} to score in "
+          f"{n_batches} batch(es) of {args.batch_size}"
+          + (f", {WORKERS} at a time" if WORKERS > 1 else "")
+          + (f" (--limit {args.limit})" if args.limit else ""))
+
+    def run_one(pdf):
+        threading.current_thread().name = pdf.stem
+        result, raw = process_pdf(pdf, instructions, schema, args)
         if result is None:
             (out / f"{pdf.stem}.raw.txt").write_text(raw)
-            print(f"    ! gave up; raw output saved to {pdf.stem}.raw.txt", file=sys.stderr)
-            failed += 1
-            continue
-        dest.write_text(json.dumps({"file": pdf.name, **result}, indent=2))
+            raise ValueError(f"gave up; raw output saved to {pdf.stem}.raw.txt")
+        write_atomic(out / f"{pdf.stem}.json", json.dumps({"file": pdf.name, **result}, indent=2))
         (out / f"{pdf.stem}.raw.txt").unlink(missing_ok=True)
-        ok += 1
 
-    # rebuild all.jsonl from the results for THIS run's input files only, so
-    # leftovers from earlier runs in the same --out folder don't mix in
-    n = 0
-    wanted = {p.stem for p in pdfs}
-    with open(out / "all.jsonl", "w") as jl:
-        for stem in sorted(wanted):
-            f = out / f"{stem}.json"
-            if f.exists():
-                rec = json.loads(f.read_text())
-                rec.setdefault("file", stem)
-                jl.write(json.dumps(rec) + "\n")
-                n += 1
+    ok, failures, streak = 0, {}, 0
+    t_start, stop = time.time(), None
+    try:
+        for b in range(n_batches):
+            batch = todo[b * args.batch_size:(b + 1) * args.batch_size]
+            print(f"--- batch {b + 1}/{n_batches} ({len(batch)} proposals)")
+            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+                futs = {pool.submit(run_one, pdf): pdf for pdf in batch}
+                for fut in as_completed(futs):
+                    pdf = futs[fut]
+                    try:
+                        fut.result()
+                        ok += 1
+                        streak = 0
+                        failures.pop(pdf.stem, None)
+                        status = "ok"
+                    except Exception as e:  # keep going on bad files
+                        failures[pdf.stem] = str(e)[:300]
+                        streak += 1
+                        status = f"FAILED: {str(e)[:150]}"
+                    done = ok + len(failures)
+                    per = (time.time() - t_start) / done
+                    with _print_lock:
+                        print(f"[{done}/{len(todo)}] {pdf.name} {status}  "
+                              f"(~{per:.0f}s each, ~{per * (len(todo) - done) / 3600:.1f}h left)")
+                    if streak >= args.max_consecutive_failures:
+                        stop = (f"{streak} failures in a row; stopping (is Ollama running? "
+                                f"`ollama ps`). Re-run to resume.")
+                        for f2 in futs:
+                            f2.cancel()
+                        break
+            write_all_jsonl(out, wanted, failures)
+            if stop:
+                print(stop, file=sys.stderr)
+                break
+    except KeyboardInterrupt:
+        print("\ninterrupted; re-run to resume (proposals already scored are kept)")
+
+    n = write_all_jsonl(out, wanted, failures)
+    remaining = sum(1 for p in pdfs if not (out / f"{p.stem}.json").exists())
+    print(f"done: {ok} new, {skipped} already done, {len(failures)} failed; "
+          f"{n} results in {out / 'all.jsonl'}"
+          + (f"; {remaining} still to score (re-run to continue)" if remaining else ""))
+    if failures:
+        print(f"failed proposals listed in {out / 'failed.txt'}; re-run to retry them")
     others = sorted(f.name for f in out.glob("*.json") if f.stem not in wanted)
-    print(f"done: {ok} new, {skipped} already done, {failed} failed; "
-          f"{n} results in {out / 'all.jsonl'}")
     if others:
         print(f"note: {len(others)} other .json file(s) in {out} from earlier runs were left out "
               f"of all.jsonl (e.g. {', '.join(others[:3])}). Use a separate --out per project.")
+
+
+def write_all_jsonl(out: Path, wanted: set, failures: dict) -> int:
+    """Rebuild all.jsonl from the results for THIS run's input files only, so
+    leftovers from earlier runs in the same --out folder don't mix in."""
+    lines = []
+    for stem in sorted(wanted):
+        f = out / f"{stem}.json"
+        if f.exists():
+            try:
+                rec = json.loads(f.read_text())
+            except json.JSONDecodeError:
+                continue
+            rec.setdefault("file", stem)
+            lines.append(json.dumps(rec))
+    write_atomic(out / "all.jsonl", "\n".join(lines) + ("\n" if lines else ""))
+    write_atomic(out / "failed.txt", "".join(f"{k}\t{v}\n" for k, v in sorted(failures.items())))
+    return len(lines)
 
 
 if __name__ == "__main__":
