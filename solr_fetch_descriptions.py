@@ -27,18 +27,28 @@ for the words "concurrence" / "concur" in the --concurrence-fields text (the
 uploaded Program Officer Concurrence Email should land there); it is a hint,
 not proof: verify in eJacket/Research.gov.
 
+Why an ID has no text (status in manifest.csv / missing_ids.txt):
+    error           the SOLR request failed (timeout etc.); re-run to retry
+    not_found       SOLR answered but has no proposal with this ID (not loaded
+                    yet? wrong ID?)
+    no_description  SOLR has the proposal but its description field is empty
+                    (text not extracted yet?)
+Run with --diagnose to look up missing IDs one at a time and list which
+fields SOLR does hold for them, plus how recent SOLR's latest load is.
+
 Output (--out, default ./solr_descriptions):
     descriptions/<id>.txt     one per proposal, ready to score
     collaborative/<id>.txt    collaborative proposals, set aside (see --collab)
     collaborative_rwr.csv     collaborative proposals to consider returning without review
     manifest.csv              id, title, status, chars, collaborative, collab group, plus
                               PI, institution, requested amount/months, concurrence check
-    missing_ids.txt           IDs SOLR didn't return or that have no description
+    missing_ids.txt           IDs without text, with the reason (see below)
     meta.jsonl                per-ID fetch log (used for resume + dedup)
 """
 
 import argparse
 import csv
+from collections import Counter
 import json
 import re
 import sys
@@ -51,9 +61,8 @@ SOLR_BASE = "http://dis-checker-a01.ad.nsf.gov/solr"
 ID_RE = re.compile(r"^\d{7}$")
 _COLLAB_RE = re.compile(r"(?i)^collaborative\s+research\s*:\s*")  # same as nsf_solr_agent
 META_FIELDS = ("pi_name,inst,inst_state,requested_amount,rqst_mnth_cnt,lead_id,lead_proposal,"
-               "received,status,program_announcement,managing_program")
+               "received,load_date,description_length,status,program_announcement,managing_program")
 RESERVED = {"id", "title", "status", "chars", "collaborative", "collab_group"}  # this script's own keys
-_CONCUR_RE = re.compile(r"(?i)\bconcur(rence|red|s)?\b")
 
 
 # --------------------------------------------------------------------------- #
@@ -88,9 +97,13 @@ def read_ids(path: Path, id_col: str | None) -> list[str]:
 # --------------------------------------------------------------------------- #
 # SOLR
 # --------------------------------------------------------------------------- #
-def fetch_batch(solr, ids, fields, retries, backoff):
-    """Fetch one batch; retry with backoff, then split the batch in half."""
-    query = "id:(" + " OR ".join(ids) + ")"
+def fetch_batch(solr, ids, fields, retries, backoff, failed=None, extra_q=""):
+    """Fetch one batch; retry with backoff, then split the batch in half.
+
+    IDs whose request still fails are added to `failed` (so they are logged as
+    'error', not mistaken for proposals SOLR doesn't have)."""
+    failed = [] if failed is None else failed
+    query = "id:(" + " OR ".join(ids) + ")" + (f" AND ({extra_q})" if extra_q else "")
     for attempt in range(1, retries + 1):
         try:
             return list(solr.search(query, fl=fields, rows=len(ids)))
@@ -100,12 +113,24 @@ def fetch_batch(solr, ids, fields, retries, backoff):
                   f"{str(e)[:150]}; retrying in {wait:.0f}s", file=sys.stderr)
             time.sleep(wait)
     if len(ids) == 1:
-        print(f"    ! giving up on {ids[0]}", file=sys.stderr)
+        print(f"    ! giving up on {ids[0]} (logged as 'error'; re-run to retry)", file=sys.stderr)
+        failed.append(ids[0])
         return []
     mid = len(ids) // 2
     print(f"    ! splitting batch {len(ids)} -> {mid} + {len(ids) - mid}", file=sys.stderr)
-    return (fetch_batch(solr, ids[:mid], fields, retries, backoff)
-            + fetch_batch(solr, ids[mid:], fields, retries, backoff))
+    return (fetch_batch(solr, ids[:mid], fields, retries, backoff, failed, extra_q)
+            + fetch_batch(solr, ids[mid:], fields, retries, backoff, failed, extra_q))
+
+
+def concurrence_ids(solr, ids, concur_fields, retries, backoff) -> set | None:
+    """IDs whose concurrence fields mention 'concurrence'/'concur', found by a SOLR
+    query (only IDs come back, not the documents' text). None if the query failed."""
+    if not concur_fields:
+        return None
+    q = " OR ".join(f"{f}:(concurrence OR concur OR concurred)" for f in concur_fields)
+    failed = []
+    docs = fetch_batch(solr, ids, "id", retries, backoff, failed, extra_q=q)
+    return None if failed else {str(d.get("id")) for d in docs}
 
 
 def as_text(v) -> str:
@@ -125,16 +150,43 @@ def meta_key(field: str) -> str:
     return f"solr_{field}" if field in RESERVED else field
 
 
-def meta_from_doc(d: dict, meta_fields: list[str], concur_fields: list[str]) -> dict:
+def meta_from_doc(d: dict, meta_fields: list[str], concur: set | None) -> dict:
     # SOLR fields named like this script's own keys (e.g. SOLR's "status") get a solr_ prefix
     m = {meta_key(f): flat(d.get(f)) for f in meta_fields}
-    if concur_fields:
-        present = [f for f in concur_fields if d.get(f) not in (None, "", [])]
-        text = " ".join(as_text(d.get(f)) for f in present)
-        # yes = the word appears; no = documents exist but no mention; "" = nothing to check
-        m["concurrence_found"] = ("yes" if _CONCUR_RE.search(text) else "no") if present else ""
+    if concur is not None:
+        m["concurrence_found"] = "yes" if str(d.get("id")) in concur else "no"
     m["meta_ok"] = True
     return m
+
+
+def diagnose(solr, ids, meta_fields, timeout_note=""):
+    """Look up IDs one at a time and show what SOLR holds for each."""
+    print(f"\n=== diagnosing {len(ids)} ID(s) one at a time ===")
+    try:
+        latest = list(solr.search("*:*", fl="load_date", sort="load_date desc", rows=1))
+        print(f"latest load_date in SOLR: {latest[0].get('load_date') if latest else '(none)'}"
+              "  (proposals submitted after this aren't in SOLR yet)")
+    except Exception as e:
+        print(f"couldn't read SOLR's latest load_date: {str(e)[:150]}")
+    for pid in ids:
+        try:
+            docs = list(solr.search(f"id:{pid}", fl="*", rows=1))
+        except Exception as e:
+            print(f"{pid}: request FAILED ({str(e)[:150]}) -> SOLR/network problem, not missing text")
+            continue
+        if not docs:
+            print(f"{pid}: SOLR has no proposal with this ID (not loaded yet, or wrong ID)")
+            continue
+        d = docs[0]
+        sizes = {k: len(as_text(v)) for k, v in d.items()}
+        text_fields = sorted((k for k, n in sizes.items() if n > 500), key=lambda k: -sizes[k])
+        print(f"{pid}: {flat(d.get('title'))[:70]}")
+        print(f"    received={flat(d.get('received'))} load_date={flat(d.get('load_date'))} "
+              f"status={flat(d.get('status'))[:40]}")
+        print(f"    description: {sizes.get('description', 0)} chars returned; SOLR's "
+              f"description_length={flat(d.get('description_length')) or '(not set)'}")
+        print("    text fields present: " + (", ".join(f"{k} ({sizes[k]:,})" for k in text_fields)
+                                              or "none longer than 500 chars"))
 
 
 # --------------------------------------------------------------------------- #
@@ -172,6 +224,9 @@ def main():
     ap.add_argument("--concurrence-fields", default="additional_documents,supplementary",
                     help="SOLR text fields searched for the PO concurrence email ('' to skip)")
     ap.add_argument("--force", action="store_true", help="re-download IDs already fetched")
+    ap.add_argument("--diagnose", type=int, nargs="?", const=10, default=0, metavar="N",
+                    help="look up N (default 10) missing IDs one at a time and report what SOLR "
+                         "holds for them; doesn't download anything")
     args = ap.parse_args()
 
     if args.ids:
@@ -211,15 +266,31 @@ def main():
         print(f"{len(meta_todo)} already-downloaded IDs need PI/institution/amount metadata")
 
     solr = pysolr.Solr(f"{SOLR_BASE}/{args.database}/", timeout=args.timeout)
-    fields = ",".join(dict.fromkeys(["id", "title", args.field] + meta_fields + concur_fields))
+    if args.diagnose:
+        missing = [i for i in todo if meta.get(i, {}).get("status") != "ok"]
+        if not missing:
+            sys.exit("nothing to diagnose: every ID has text")
+        by = {}
+        for i in missing:
+            by.setdefault(meta.get(i, {}).get("status", "not tried yet"), []).append(i)
+        print("IDs without text, by logged reason: "
+              + ", ".join(f"{k} {len(v)}" for k, v in by.items()))
+        # sample a few of each reason
+        per = max(1, args.diagnose // len(by))
+        diagnose(solr, [i for v in by.values() for i in v[:per]][:args.diagnose], meta_fields)
+        return
+    fields = ",".join(dict.fromkeys(["id", "title", args.field] + meta_fields))
     n_batches = (len(todo) + args.batch_size - 1) // args.batch_size
 
     with open(meta_path, "a") as mf:
         for b in range(n_batches):
             batch = todo[b * args.batch_size:(b + 1) * args.batch_size]
             t0 = time.time()
+            failed = []
             try:
-                docs = fetch_batch(solr, batch, fields, args.retries, args.backoff)
+                docs = fetch_batch(solr, batch, fields, args.retries, args.backoff, failed)
+                concur = concurrence_ids(solr, [str(d.get("id")) for d in docs], concur_fields,
+                                         args.retries, args.backoff) if docs else None
             except KeyboardInterrupt:
                 print("\ninterrupted; re-run to resume")
                 break
@@ -227,37 +298,41 @@ def main():
             for pid in batch:
                 d = found.get(pid)
                 if d is None:
-                    rec = {"id": pid, "status": "not_found", "title": "", "chars": 0}
+                    rec = {"id": pid, "status": "error" if pid in failed else "not_found",
+                           "title": "", "chars": 0}
                 else:
                     text = as_text(d.get(args.field)).strip()
                     title = as_text(d.get("title")).strip()
                     rec = {"id": pid, "title": title, "chars": len(text),
                            "status": "ok" if text else "no_description",
-                           **meta_from_doc(d, meta_fields, concur_fields)}
+                           **meta_from_doc(d, meta_fields, concur)}
                     if text:
                         (desc_dir / f"{pid}.txt").write_text(
                             f"Proposal {pid}: {title}\n\n{text}\n")
                 meta[pid] = rec
                 mf.write(json.dumps(rec) + "\n")
             mf.flush()
-            ok = sum(1 for p in batch if meta[p]["status"] == "ok")
-            print(f"[batch {b + 1}/{n_batches}] {ok}/{len(batch)} with text "
-                  f"({time.time() - t0:.0f}s)")
+            st = Counter(meta[p]["status"] for p in batch)
+            print(f"[batch {b + 1}/{n_batches}] {st['ok']}/{len(batch)} with text"
+                  + "".join(f", {st[k]} {k}" for k in ("not_found", "no_description", "error") if st[k])
+                  + f" ({time.time() - t0:.0f}s)")
             if b + 1 < n_batches:
                 time.sleep(args.pause)
 
-        meta_only = ",".join(dict.fromkeys(["id"] + meta_fields + concur_fields))
+        meta_only = ",".join(dict.fromkeys(["id"] + meta_fields))
         for b in range(0, len(meta_todo), args.batch_size):
             batch = meta_todo[b:b + args.batch_size]
             try:
                 docs = fetch_batch(solr, batch, meta_only, args.retries, args.backoff)
+                concur = concurrence_ids(solr, [str(d.get("id")) for d in docs], concur_fields,
+                                         args.retries, args.backoff) if docs else None
             except KeyboardInterrupt:
                 print("\ninterrupted; re-run to resume")
                 break
             for d in docs:
                 pid = str(d.get("id"))
                 if pid in meta:
-                    meta[pid].update(meta_from_doc(d, meta_fields, concur_fields))
+                    meta[pid].update(meta_from_doc(d, meta_fields, concur))
                     mf.write(json.dumps(meta[pid]) + "\n")
             mf.flush()
             print(f"[metadata {b // args.batch_size + 1}/{(len(meta_todo) + args.batch_size - 1) // args.batch_size}] "
@@ -325,7 +400,8 @@ def main():
         w.writerows(rwr)
 
     missing = [r["id"] for r in rows if r["status"] != "ok"]
-    (out / "missing_ids.txt").write_text("\n".join(missing) + ("\n" if missing else ""))
+    (out / "missing_ids.txt").write_text("".join(f"{r['id']}\t{r['status']}\n" for r in rows
+                                                 if r["status"] != "ok"))
     n_desc = len(list(desc_dir.glob("*.txt")))
     n_set_aside = len(list(collab_dir.glob("*.txt")))
     print(f"\ndone: {n_desc} descriptions ready to score in {desc_dir}"
@@ -338,6 +414,15 @@ def main():
     not_run = len(ids) - len(rows)
     if not_run:
         print(f"{not_run} IDs not attempted yet; re-run to continue")
+    if missing:
+        st = Counter(r["status"] for r in rows if r["status"] != "ok")
+        why = {"error": "SOLR request failed (timeout/network); re-run to retry",
+               "not_found": "SOLR has no proposal with that ID (not loaded yet, or wrong ID)",
+               "no_description": "SOLR has the proposal but no description text"}
+        print("no text, by reason:")
+        for k, n in st.most_common():
+            print(f"    {n:5d}  {k:15s} {why.get(k, '')}")
+        print("for details on a sample: python solr_fetch_descriptions.py <same ids> --diagnose")
 
 
 if __name__ == "__main__":
