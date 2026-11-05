@@ -51,17 +51,42 @@ GUESS = {
 }
 
 
-def read_pdf(path: Path) -> tuple[str, int]:
+def pdf_library():
+    """Which PDF reader is installed; exits with instructions if none is."""
     try:
-        import fitz  # pymupdf
+        import fitz  # noqa: F401  (pymupdf)
+        return "pymupdf"
+    except ImportError:
+        pass
+    try:
+        import pypdf  # noqa: F401
+        return "pypdf"
+    except ImportError:
+        sys.exit(f"no PDF library in this Python ({sys.executable}).\n"
+                 "Install one:  pip install pymupdf   (or: pip install pypdf)\n"
+                 "or run with the Python that pdf_batch_extract.py uses for PDFs.")
+
+
+def read_pdf(path: Path) -> tuple[str, int]:
+    with open(path, "rb") as fh:
+        head = fh.read(1024)
+    if b"%PDF" not in head:
+        sniff = head[:80].decode("utf-8", "replace").replace("\n", " ").strip()
+        raise ValueError(f"not a PDF (file starts with: {sniff!r}); an error page or "
+                         "JSON saved as .pdf?")
+    if pdf_library() == "pymupdf":
+        import fitz
 
         with fitz.open(path) as doc:
+            if doc.needs_pass:
+                raise ValueError("password-protected PDF")
             return "\n".join(p.get_text() for p in doc), len(doc)
-    except ImportError:
-        from pypdf import PdfReader
+    from pypdf import PdfReader
 
-        r = PdfReader(path)
-        return "\n".join((p.extract_text() or "") for p in r.pages), len(r.pages)
+    r = PdfReader(path)
+    if r.is_encrypted:
+        raise ValueError("password-protected PDF")
+    return "\n".join((p.extract_text() or "") for p in r.pages), len(r.pages)
 
 
 def load_metadata(path: Path, cols: dict) -> tuple[dict, dict]:
@@ -141,7 +166,7 @@ def main():
     pdfs = sorted(p for p in Path(args.pdf_dir).rglob("*") if p.suffix.lower() == ".pdf")
     if not pdfs:
         sys.exit(f"no PDFs found in {args.pdf_dir}")
-    print(f"{len(pdfs)} PDFs in {args.pdf_dir}")
+    print(f"{len(pdfs)} PDFs in {args.pdf_dir}; reading them with {pdf_library()}")
 
     rows, seen = {}, {}
     converted = left = 0
@@ -251,6 +276,11 @@ def main():
     print("\nPDFs by result:")
     for k, n in st.most_common():
         print(f"    {n:5d}  {k:20s} {why.get(k, '')}")
+    bad = Counter(r.get("detail", "")[:120] for r in rows.values() if r["status"] == "unreadable")
+    if bad:
+        print("unreadable PDFs, most common reasons:")
+        for d, n in bad.most_common(3):
+            print(f"    {n:5d}  {d}")
     no_meta = [r["id"] for r in ok if r["id"] not in meta] if meta else []
     if no_meta:
         print(f"! {len(no_meta)} converted IDs aren't in the metadata spreadsheet "
