@@ -50,6 +50,23 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 THINK = False  # set by --think
 WORKERS = 1    # set by --workers; >1 prefixes log lines with the proposal name
 _print_lock = threading.Lock()
+_stats = threading.local()  # per-proposal token/time totals, reset in run_one
+
+
+def _add_stats(data: dict):
+    for k in ("prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
+        setattr(_stats, k, getattr(_stats, k, 0) + (data.get(k) or 0))
+
+
+def stats_line() -> str:
+    """'in 18.2K tok 35s · out 1.3K tok 41s (32 tok/s)' from Ollama's timings."""
+    g = lambda k: getattr(_stats, k, 0)
+    if not g("eval_count"):
+        return ""
+    in_s, out_s = g("prompt_eval_duration") / 1e9, g("eval_duration") / 1e9
+    rate = f" ({g('eval_count') / out_s:.0f} tok/s)" if out_s else ""
+    return (f"in {g('prompt_eval_count') / 1000:.1f}K tok {in_s:.0f}s · "
+            f"out {g('eval_count') / 1000:.1f}K tok {out_s:.0f}s{rate}")
 
 
 def warn(msg: str):
@@ -131,6 +148,7 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
     if not r.ok:
         raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:300]}")
     data = r.json()
+    _add_stats(data)
     msg = data.get("message", {})
     content = msg.get("content", "")
     if data.get("done_reason") == "length":
@@ -409,12 +427,14 @@ def main():
 
     def run_one(pdf):
         threading.current_thread().name = pdf.stem
+        _stats.__dict__.clear()
         result, raw = process_pdf(pdf, instructions, schema, args)
         if result is None:
             (out / f"{pdf.stem}.raw.txt").write_text(raw)
             raise ValueError(f"gave up; raw output saved to {pdf.stem}.raw.txt")
         write_atomic(out / f"{pdf.stem}.json", json.dumps({"file": pdf.name, **result}, indent=2))
         (out / f"{pdf.stem}.raw.txt").unlink(missing_ok=True)
+        return stats_line()
 
     ok, failures, streak = 0, {}, 0
     t_start, stop = time.time(), None
@@ -427,11 +447,11 @@ def main():
                 for fut in as_completed(futs):
                     pdf = futs[fut]
                     try:
-                        fut.result()
+                        timing = fut.result()
                         ok += 1
                         streak = 0
                         failures.pop(pdf.stem, None)
-                        status = "ok"
+                        status = "ok" + (f" [{timing}]" if timing else "")
                     except Exception as e:  # keep going on bad files
                         failures[pdf.stem] = str(e)[:300]
                         streak += 1
