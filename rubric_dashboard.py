@@ -542,9 +542,16 @@ def main():
         with st.sidebar:
             hide = st.checkbox(f"Hide duplicate copies ({sum(len(g) - 1 for g in groups)})", value=True,
                                help="Same description text under different proposal IDs. Keeps the "
-                                    "highest (newest) ID of each group; all are listed in the QA tab.")
+                                    "SOLR copy, else the highest (newest) ID; all are listed in the QA tab.")
         if hide:
-            dup_hidden = [i for g in groups for i in g[:-1]]
+            solr_ids = set()
+            man = Path(desc_path).parent / "manifest.csv"
+            if man.is_file():
+                m = pd.read_csv(man, dtype=str).fillna("")
+                solr_ids = set(m.loc[m.get("status", "ok") == "ok", "id"])
+            # keep the SOLR copy if there is one (fuller metadata), else the newest ID
+            keep = {max(g, key=lambda i: (i in solr_ids, i)) for g in groups}
+            dup_hidden = [i for g in groups for i in g if i not in keep]
             df = df[~df["id"].isin(dup_hidden)].reset_index(drop=True)
 
     has_flags = df["agency_level"].notna().any()
