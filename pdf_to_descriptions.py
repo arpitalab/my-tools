@@ -11,6 +11,7 @@ Titles, PI, institution and requested amount come from your ID spreadsheet
 Usage:
     python pdf_to_descriptions.py pd_pdfs/ --metadata ids.xlsx
     python pdf_to_descriptions.py pd_pdfs/ --metadata ids.xlsx --title-col "Proposal Title"
+    python pdf_to_descriptions.py pd_pdfs/ --metadata ids.xlsx --limit 20   # try 20 first
 
     # then score everything (SOLR text + converted PDFs) in one go
     python pdf_batch_extract.py solr_descriptions/descriptions --out output/ai_datasets_r06 ...
@@ -108,6 +109,8 @@ def main():
     ap.add_argument("--collab", choices=["rwr", "dedup", "keep"], default="rwr",
                     help="collaborative proposals: rwr = set every copy aside (default); "
                          "dedup = score one copy per project; keep = score all")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="convert at most N new PDFs this run (0 = all); re-run to continue")
     ap.add_argument("--force", action="store_true", help="re-convert PDFs already converted")
     args = ap.parse_args()
 
@@ -141,6 +144,7 @@ def main():
     print(f"{len(pdfs)} PDFs in {args.pdf_dir}")
 
     rows, seen = {}, {}
+    converted = left = 0
     for i, pdf in enumerate(pdfs, 1):
         found = sorted(set(ID_IN_NAME.findall(pdf.stem)))
         if len(found) != 1:
@@ -163,6 +167,10 @@ def main():
         if have and not args.force and prev.get(pid, {}).get("status") == "ok":
             rows[pdf.name] = {**prev[pid], **{k: v for k, v in rec.items() if v}}
             continue
+        if args.limit and converted >= args.limit:
+            left += 1  # not recorded, so the next run picks it up
+            continue
+        converted += 1
         try:
             text, pages = read_pdf(pdf)
         except Exception as e:
@@ -252,6 +260,8 @@ def main():
                 "keep": "all kept for scoring"}[args.collab]
         print(f"{len(rwr)} collaborative proposal(s) found ({verb}); "
               f"listed in {out / 'collaborative_rwr_pdf.csv'}")
+    if left:
+        print(f"--limit {args.limit}: {left} PDF(s) not converted yet; re-run to continue")
     n_desc = len(list(desc_dir.glob("*.txt")))
     print(f"{n_desc} descriptions ready to score in {desc_dir}; details in {manifest_path}")
 
