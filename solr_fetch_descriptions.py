@@ -15,6 +15,10 @@ Usage:
     # then analyze them
     python pdf_batch_extract.py solr_descriptions/descriptions
 
+IDs converted from PDFs by pdf_to_descriptions.py are skipped. After this script
+adds new proposals, re-run pdf_to_descriptions.py so its collaborative check
+also compares the PDF proposals with the new SOLR titles.
+
 Re-running is safe: IDs already downloaded are skipped and failed/missing ones
 are retried, so an interrupted or timed-out run picks up where it left off
 (use --force to re-download everything). IDs downloaded by an older version
@@ -250,6 +254,18 @@ def main():
         old_dir.rmdir()
     meta_path = out / "meta.jsonl"
     meta = {} if args.force else load_meta(meta_path)
+
+    # IDs whose text came from PDFs (pdf_to_descriptions.py) are left alone, so
+    # SOLR doesn't overwrite text that was already scored or move their files
+    pdf_man = out / "pdf_manifest.csv"
+    if pdf_man.exists() and not args.force:
+        with open(pdf_man) as f:
+            from_pdf = {r["id"] for r in csv.DictReader(f) if r.get("status") == "ok"}
+        skip = [i for i in ids if i in from_pdf and meta.get(i, {}).get("status") != "ok"]
+        if skip:
+            ids = [i for i in ids if i not in set(skip)]
+            print(f"{len(skip)} IDs already have text from PDFs (pdf_manifest.csv); skipping them "
+                  "(--force to fetch from SOLR anyway)")
 
     # retry anything not yet fetched OK (incl. failed batches / not-yet-indexed),
     # and anything logged as OK whose .txt has since been deleted
