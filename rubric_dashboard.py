@@ -48,7 +48,7 @@ PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-04b (planning scope + compliance)"
+DASHBOARD_VERSION = "2026-11-06 (PDF descriptions)"
 
 
 def newest_results(root="output"):
@@ -177,11 +177,13 @@ def load_results(path: str, mtime: float):
 def load_titles(desc_dir: str, mtime: float) -> dict:
     """Titles from solr_fetch_descriptions manifest.csv, else each file's first line."""
     d = Path(desc_dir)
-    manifest = d.parent / "manifest.csv"
     titles = {}
-    if manifest.exists():
-        m = pd.read_csv(manifest, dtype=str).fillna("")
-        titles = dict(zip(m["id"], m["title"]))
+    for name in ("pdf_manifest.csv", "manifest.csv"):  # SOLR titles win
+        manifest = d.parent / name
+        if manifest.exists():
+            m = pd.read_csv(manifest, dtype=str).fillna("")
+            if "title" in m:
+                titles.update({i: t for i, t in zip(m["id"], m["title"]) if i and t})
     for f in d.glob("*.txt"):
         if f.stem not in titles or not titles[f.stem]:
             with open(f, errors="replace") as fh:
@@ -197,11 +199,20 @@ def _money(v):
 
 @st.cache_data(show_spinner=False)
 def load_manifest_meta(desc_dir: str, mtime: float) -> pd.DataFrame:
-    """PI / institution / requested amount / months / concurrence from manifest.csv."""
-    manifest = Path(desc_dir).parent / "manifest.csv"
-    if not manifest.exists():
+    """PI / institution / requested amount / months / concurrence / pages from
+    manifest.csv (SOLR) and pdf_manifest.csv (pdf_to_descriptions.py)."""
+    parts = []
+    for name in ("manifest.csv", "pdf_manifest.csv"):
+        f = Path(desc_dir).parent / name
+        if f.exists():
+            part = pd.read_csv(f, dtype=str).fillna("")
+            if "status" in part:
+                part = part[part["status"] == "ok"]
+            parts.append(part)
+    if not parts:
         return pd.DataFrame(columns=["id"])
-    m = pd.read_csv(manifest, dtype=str).fillna("")
+    m = pd.concat(parts, ignore_index=True).fillna("")
+    m = m[m["id"] != ""].drop_duplicates("id", keep="first")  # SOLR row first
     out = pd.DataFrame({"id": m["id"]})
     if "pi_name" in m:
         out["PI"] = m["pi_name"]
@@ -213,6 +224,8 @@ def load_manifest_meta(desc_dir: str, mtime: float) -> pd.DataFrame:
         out["months"] = m["rqst_mnth_cnt"].map(_money)
     if "concurrence_found" in m:
         out["concurrence_found"] = m["concurrence_found"]
+    if "pages" in m:
+        out["pages"] = m["pages"].map(_money)
     # drop columns SOLR never filled
     keep = ["id"] + [c for c in out.columns if c != "id"
                      and out[c].replace("", pd.NA).notna().any()]
@@ -444,12 +457,13 @@ def main():
     extra_cols = []
     money_cols = []
     if desc_path and Path(desc_path).is_dir():
-        mm = load_manifest_meta(desc_path, (Path(desc_path).parent / "manifest.csv").stat().st_mtime
-                                if (Path(desc_path).parent / "manifest.csv").exists() else 0)
+        mtimes = [f.stat().st_mtime for f in (Path(desc_path).parent / "manifest.csv",
+                                              Path(desc_path).parent / "pdf_manifest.csv") if f.exists()]
+        mm = load_manifest_meta(desc_path, max(mtimes, default=0))
         if len(mm.columns) > 1:
             df = df.merge(mm, on="id", how="left")
             extra_cols += [c for c in ("PI", "institution") if c in mm.columns]
-            money_cols = [c for c in ("requested $", "months") if c in mm.columns]
+            money_cols = [c for c in ("requested $", "months", "pages") if c in mm.columns]
     if "concurrence_found" not in df.columns:
         df["concurrence_found"] = ""
     df["concurrence_found"] = df["concurrence_found"].fillna("")
@@ -765,9 +779,11 @@ def main():
 
     # ---- QA --------------------------------------------------------------- #
     with tabs[5]:
-        rwr_file = Path(desc_path).parent / "collaborative_rwr.csv" if desc_path else None
-        if rwr_file and rwr_file.is_file():
-            rwr = pd.read_csv(rwr_file, dtype=str).fillna("")
+        rwr_files = [Path(desc_path).parent / n for n in ("collaborative_rwr.csv",
+                                                          "collaborative_rwr_pdf.csv")] if desc_path else []
+        rwr_parts = [pd.read_csv(f, dtype=str).fillna("") for f in rwr_files if f.is_file()]
+        if rwr_parts:
+            rwr = pd.concat(rwr_parts, ignore_index=True).drop_duplicates("id")
             if len(rwr):
                 st.subheader(f"Collaborative proposals: {len(rwr)} return-without-review candidates")
                 st.caption("Found by solr_fetch_descriptions.py and not scored (collaborative "
@@ -800,6 +816,11 @@ def main():
         failed = sorted(p.name.replace(".raw.txt", "") for p in Path(res_path).parent.glob("*.raw.txt"))
         for pid in failed:
             issues.append((pid, "model output could not be parsed (see .raw.txt)"))
+        pdf_man = Path(desc_path).parent / "pdf_manifest.csv" if desc_path else None
+        if pdf_man and pdf_man.is_file():
+            pm = pd.read_csv(pdf_man, dtype=str).fillna("")
+            for _, r in pm[~pm["status"].isin(["ok", "has_solr_text"])].iterrows():
+                issues.append((r["id"] or "?", f"PDF not converted: {r['status']}", r["file"]))
         if desc_path and Path(desc_path).is_dir():
             scored = set(df["id"])
             not_scored = sorted(p.stem for p in Path(desc_path).glob("*.txt") if p.stem not in scored)
