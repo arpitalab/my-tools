@@ -49,7 +49,7 @@ PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-06b (duplicate check)"
+DASHBOARD_VERSION = "2026-11-06c (rule-based overall)"
 
 
 def newest_results(root="output"):
@@ -257,6 +257,31 @@ def duplicate_groups(pairs: pd.DataFrame) -> list[list[str]]:
     for x in parent:
         groups[root(x)].append(x)
     return [sorted(g) for g in groups.values()]
+
+
+# Rule-based overall: (dimension index, score, highest overall allowed).
+# D1 (program fit) and D2 (AI-readiness) are must-haves, so a weak score on
+# either caps the overall no matter how well assembled the rest is.
+RULE_CAPS = ((0, 0, 1), (0, 1, 2), (1, 0, 2), (1, 1, 3))
+RULE_WEIGHTS = (2, 2, 2, 1, 1, 1)  # D1-D3 count double
+
+
+def rule_overall(df: pd.DataFrame, dims: list, weights: dict, caps: bool = True) -> pd.Series:
+    """Deterministic 0-5 overall from the stored D1-D6 scores: weighted mean
+    rescaled to 0-5 and rounded half up, then the must-have caps."""
+    total = sum(weights.values())
+
+    def one(r):
+        vals = [r[d] for d in dims]
+        if not total or any(pd.isna(v) for v in vals):
+            return pd.NA
+        s = int(5 * sum(weights[d] * v for d, v in zip(dims, vals)) / (3 * total) + 0.5)
+        if caps:
+            for i, score, top in RULE_CAPS:
+                if i < len(dims) and vals[i] == score:
+                    s = min(s, top)
+        return s
+    return df.apply(one, axis=1).astype("Int64") if len(df) else pd.Series(dtype="Int64")
 
 
 def _money(v):
@@ -575,6 +600,32 @@ def main():
     has_ffrdc = df["ffrdc"].notna().any()
     has_domain = df["primary_dir"].notna().any()
     has_plan = df["plan_level"].notna().any()
+
+    # ---- which overall score to use -------------------------------------- #
+    df["overall_model"] = df["overall"]
+    df["overall_rule"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+    basis = "Model's"
+    if len(dims) >= 2:
+        with st.sidebar:
+            st.header("Overall score")
+            basis = st.radio("Used in charts, filters and tables", ["Model's", "Rule-based"],
+                             horizontal=True,
+                             help="Model's: the overall score Gemma assigned. Rule-based: computed "
+                                  "here from the stored D1-D6 scores (weights and caps below), "
+                                  "so it can be changed without rescoring.")
+            with st.expander("Rule-based weights and caps"):
+                weights = {d: st.number_input(d, 0, 5, RULE_WEIGHTS[i] if i < len(RULE_WEIGHTS) else 1,
+                                              key=f"w_{i}") for i, d in enumerate(dims)}
+                caps = st.checkbox("Must-have caps", value=True,
+                                   help="D1 = 0 → overall ≤ 1; D1 = 1 → ≤ 2; "
+                                        "D2 = 0 → ≤ 2; D2 = 1 → ≤ 3")
+                st.caption("Overall = weighted mean of D1-D6, rescaled to 0-5 and rounded, "
+                           "then capped.")
+        df["overall_rule"] = rule_overall(df, dims, weights, caps)
+        if basis == "Rule-based":
+            df["overall"] = df["overall_rule"]
+    other_col = "overall_rule" if basis == "Model's" else "overall_model"
+
     df["declared"] = df["title"].map(lambda t: "Planning" if PLAN_PREFIX_RE.match(str(t))
                                      else ("" if not str(t).strip() else "Impact/Flagship"))
     df["is_planning"] = (df["declared"] == "Planning") | (df["proposal_type"] == "Planning")
@@ -668,6 +719,17 @@ def main():
             means = f.groupby("proposal_type")[dims + ["overall"]].mean().round(2)
             means.insert(0, "n", f.groupby("proposal_type").size())
             st.dataframe(means, use_container_width=True)
+        if len(dims) >= 2 and f["overall_rule"].notna().any():
+            st.subheader("Model's overall vs rule-based overall")
+            ct = pd.crosstab(f["overall_model"].rename("model's overall ↓"),
+                             f["overall_rule"].rename("rule-based →"))
+            st.dataframe(ct, use_container_width=True)
+            both = f[f["overall_model"].notna() & f["overall_rule"].notna()]
+            gap = (both["overall_model"] - both["overall_rule"]).abs()
+            weak = both[((both[dims[0]] <= 1) | (both[dims[1]] <= 1)) & (both["overall_model"] >= 3)]
+            st.caption(f"{(gap == 0).sum()} of {len(both)} agree exactly; {(gap >= 2).sum()} differ by "
+                       f"2 or more. {len(weak)} have D1 or D2 ≤ 1 but a model overall ≥ 3 (well "
+                       "assembled but weak on a must-have); they're listed in the QA tab.")
 
     # ---- Domains ---------------------------------------------------------- #
     with tabs[1]:
@@ -800,14 +862,17 @@ def main():
             cols += ["plan_level"]
         if has_domain:
             cols += ["primary_dir", "secondary_dirs", "field"]
-        cols += ["overall"] + dims
+        cols += ["overall"] + ([other_col] if len(dims) >= 2 else []) + dims
         if has_flags:
             cols += ["agency_level", "agencies"]
         if has_ffrdc:
             cols += ["ffrdc_entities"]
         cols = list(dict.fromkeys(c for c in cols if c in f.columns))
         table = f[cols].sort_values("overall", ascending=False)
-        cfg = {"overall": st.column_config.NumberColumn("overall", format="%d"),
+        cfg = {"overall": st.column_config.NumberColumn(
+                   "overall" if len(dims) < 2 else f"overall ({basis.lower()})", format="%d"),
+               "overall_rule": st.column_config.NumberColumn("rule-based", format="%d"),
+               "overall_model": st.column_config.NumberColumn("model's overall", format="%d"),
                "requested $": st.column_config.NumberColumn("requested $", format="$%d"),
                "plan_level": st.column_config.TextColumn("planning scope"),
                "title": st.column_config.TextColumn(width="large")}
@@ -847,8 +912,11 @@ def main():
             with st.expander("Scores and justifications", expanded=False):
                 detail = pd.DataFrame(
                     [{"dimension": d, "score": r[d], "justification": r[d + "__just"]} for d in dims]
-                    + [{"dimension": "Overall (0–5)", "score": r["overall"],
-                        "justification": r["overall_just"]}])
+                    + [{"dimension": "Overall (0–5), model's", "score": r["overall_model"],
+                        "justification": r["overall_just"]}]
+                    + ([{"dimension": "Overall (0–5), rule-based", "score": r["overall_rule"],
+                         "justification": "weighted mean of the scores above, with must-have caps "
+                                          "(sidebar)"}] if len(dims) >= 2 else []))
                 st.dataframe(detail, hide_index=True, use_container_width=True,
                              column_config={"justification": st.column_config.TextColumn(width="large")})
                 if has_domain and r["domain_just"]:
@@ -900,16 +968,20 @@ def main():
         if dims:
             d2 = dims[1] if len(dims) > 1 else None
             for _, r in df.iterrows():
-                if r[dims[0]] == 0 and (r["overall"] or 0) > 1:
+                mo = r["overall_model"] if pd.notna(r["overall_model"]) else 0
+                if r[dims[0]] == 0 and mo > 1:
                     issues.append((r["id"], "D1 = 0 but overall > 1 (gatekeeper rule)"))
-                if d2 and r[d2] == 0 and (r["overall"] or 0) > 2:
+                if d2 and r[d2] == 0 and mo > 2:
                     issues.append((r["id"], "D2 = 0 but overall > 2 (essential rule)"))
                 if re.match(r"(?i)\s*collaborative\s+research\s*:", str(r["title"])):
                     issues.append((r["id"], "scored, but title says Collaborative Research "
                                             "(return-without-review candidate)"))
                 if has_domain and not r["primary_dir"]:
                     issues.append((r["id"], "missing primary directorate"))
-                if any(pd.isna(r[d]) for d in dims) or pd.isna(r["overall"]):
+                if (r[dims[0]] == 1 and mo > 2) or (d2 and r[d2] == 1 and mo > 3):
+                    issues.append((r["id"], "D1 or D2 = 1 but model overall above the must-have cap",
+                                   f"D1={r[dims[0]]}, D2={r[d2] if d2 else '–'}, overall={mo}"))
+                if any(pd.isna(r[d]) for d in dims) or pd.isna(r["overall_model"]):
                     issues.append((r["id"], "missing score(s)"))
                 if has_flags and r["agency_level"] == "none" and r["agencies"]:
                     issues.append((r["id"], "agency level 'none' but agencies listed"))
