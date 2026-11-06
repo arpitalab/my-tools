@@ -524,12 +524,18 @@ def main():
         st.header("Data")
         res_path = st.text_input("Results (all.jsonl)", defaults.results)
         desc_path = st.text_input("Descriptions folder (optional)", defaults.descriptions)
-        meta_path = st.text_input("ID spreadsheet for PI/institution (optional)", defaults.metadata)
+        meta_path = st.text_input("ID spreadsheet for PI/institution (optional)", defaults.metadata,
+                                  help="Usually not needed: PI, institution and $ from the sheet given "
+                                       "to pdf_to_descriptions.py are already in pdf_manifest.csv.")
+        if meta_path and not Path(meta_path).is_file():
+            st.warning(f"ID spreadsheet not found: `{meta_path}` (relative paths are from "
+                       f"`{Path.cwd()}`)")
         ffrdc_path = st.text_input("FFRDC list", str(Path(__file__).parent / "ffrdc_list.csv"))
         others = [str(p) for p in Path("output").rglob("all.jsonl")] if Path("output").is_dir() else []
         if len(others) > 1:
             st.caption("Other results files: " + ", ".join(f"`{o}`" for o in others if o != res_path))
         st.caption(f"Dashboard version {DASHBOARD_VERSION}")
+        st.caption("Started with: `" + (" ".join(sys.argv[1:]) or "(no arguments)") + "`")
 
     if not Path(res_path).is_file():
         st.error(f"Results file not found: `{res_path}`. Run pdf_batch_extract.py first, "
