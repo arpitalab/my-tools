@@ -122,6 +122,63 @@ RUBRIC (scoring section):
 Respond ONLY with a single raw JSON object starting with '{{'. No markdown fences, no commentary."""
 
 
+def reshape(cand: dict, dim_keys: list) -> dict:
+    """Accept the common near-misses: dimensions at the top level or under the
+    scorer's own name ('dimension_scores'), 'overall_score' for 'overall', and
+    'score' for 'suggested_score'."""
+    if not isinstance(cand, dict):
+        return cand
+    if not isinstance(cand.get("dimensions"), dict):
+        for alt in ("dimension_scores", "dimension_audit", "audit", "scores"):
+            if isinstance(cand.get(alt), dict):
+                cand["dimensions"] = cand.pop(alt)
+                break
+        else:
+            top = {k: cand.pop(k) for k in list(cand)
+                   if re.match(r"(?i)d\d+", k) and isinstance(cand[k], dict)}
+            if top:
+                cand["dimensions"] = top
+    if not isinstance(cand.get("overall"), dict):
+        for alt in ("overall_score", "overall_audit"):
+            if isinstance(cand.get(alt), dict):
+                cand["overall"] = cand.pop(alt)
+                break
+    dims = cand.get("dimensions") if isinstance(cand.get("dimensions"), dict) else {}
+    for part in list(dims.values()) + [cand.get("overall")]:
+        if not isinstance(part, dict):
+            continue
+        if "suggested_score" not in part and "score" in part:
+            part["suggested_score"] = part.pop("score")
+        v = part.get("suggested_score")
+        if isinstance(v, str) and v.strip().isdigit():
+            part["suggested_score"] = int(v)
+        if isinstance(part.get("verdict"), str):
+            part["verdict"] = part["verdict"].strip().lower().replace("_", " ")
+        for k in ("missing", "reason"):
+            if k in part and part[k] is None:
+                part[k] = ""
+        for k in ("quotes_for_lower", "quotes_for_higher"):
+            if k in part and part[k] is None:
+                part[k] = []
+            elif isinstance(part.get(k), str):
+                part[k] = [part[k]] if part[k].strip() else []
+            if isinstance(part.get(k), list):
+                part[k] = [q for q in part[k] if isinstance(q, str) and q.strip()][:3]
+        if part is not cand.get("overall"):
+            part.setdefault("missing", "")
+            part.setdefault("quotes_for_lower", [])
+            part.setdefault("quotes_for_higher", [])
+    return cand
+
+
+def skeleton(dim_keys: list) -> str:
+    d = ('{"verdict": "supported | too high | too low", "suggested_score": 0-3, '
+         '"quotes_for_lower": ["..."], "quotes_for_higher": ["..."], "missing": "", "reason": "..."}')
+    inner = ",\n    ".join(f'"{k}": {d}' for k in dim_keys)
+    return ('{\n  "dimensions": {\n    ' + inner + '\n  },\n  "overall": {"verdict": "supported | '
+            'too high | too low", "suggested_score": 0-5, "reason": "..."}\n}')
+
+
 def user_message(pid: str, text: str, scored: dict) -> str:
     dims = scored.get("dimension_scores") or {}
     lines = [f"PROPOSAL TEXT ({pid}):", "", text, "", "STORED SCORES TO AUDIT:",
@@ -131,8 +188,8 @@ def user_message(pid: str, text: str, scored: dict) -> str:
         lines.append(f"- {k}: {v.get('score')}  (justification: {v.get('justification', '')})")
     ov = scored.get("overall_score") or {}
     lines.append(f"- overall (0-5): {ov.get('score')}  (justification: {ov.get('justification', '')})")
-    lines += ["", "Audit every dimension and the overall score. Use exactly these dimension keys: "
-              + ", ".join(dims)]
+    lines += ["", "Audit every dimension and the overall score. Reply in exactly this layout, "
+              "with all six dimensions inside \"dimensions\":", skeleton(list(dims))]
     return "\n".join(lines)
 
 
@@ -217,6 +274,7 @@ def critique(pid, scored, desc_dir: Path, system: str, args):
             messages += [{"role": "assistant", "content": raw},
                          {"role": "user", "content": "That was not valid JSON. Return the complete JSON object only."}]
             continue
+        reshape(cand, dim_keys)
         pbe.repair_keys(cand, schema)
         probs = pbe.schema_problems(cand, schema)
         result = cand
@@ -304,7 +362,12 @@ def cmd_run(args):
         ids = [i for i in want if i in scored]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    done = lambda pid: (out / f"{pid}.json").is_file()
+    def done(pid):  # a saved reply with no usable verdicts (e.g. wrong layout) is redone
+        try:
+            rec = json.loads((out / f"{pid}.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        return any(d.get("verdict") in VERDICTS for d in (rec.get("dimensions") or {}).values())
     todo = [i for i in ids if args.force or not done(i)]
     if args.limit:
         todo = todo[:args.limit]
@@ -346,9 +409,8 @@ def cmd_run(args):
         print("\ninterrupted; re-run to resume")
     rows = []
     for pid in ids:
-        f = out / f"{pid}.json"
-        if f.is_file():
-            rows += summary_rows(json.loads(f.read_text()))
+        if done(pid):
+            rows += summary_rows(json.loads((out / f"{pid}.json").read_text()))
     if rows:
         with open(out / "critic_summary.csv", "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(rows[0]))
