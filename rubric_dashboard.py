@@ -87,12 +87,29 @@ def _get(d, *path, default=None):
     return d
 
 
+# Division (or old directorate) codes the model sometimes gives instead of a directorate
+DIVISION_TO_DIR = {
+    **dict.fromkeys(["DBI", "DEB", "IOS", "MCB", "EF"], "BIO"),
+    **dict.fromkeys(["CCF", "CNS", "IIS", "OAC"], "CISE"),
+    **dict.fromkeys(["EHR", "DGE", "DRL", "DUE", "EES", "HRD"], "EDU"),
+    **dict.fromkeys(["CBET", "CMMI", "ECCS", "EEC", "EFMA"], "ENG"),
+    **dict.fromkeys(["AGS", "EAR", "OCE", "OPP", "RISE"], "GEO"),
+    **dict.fromkeys(["AST", "CHE", "DMR", "DMS", "PHY", "OMA"], "MPS"),
+    **dict.fromkeys(["BCS", "SES", "NCSES", "SMA"], "SBE"),
+    **dict.fromkeys(["ITE", "TF"], "TIP"),
+}
+
+
 def _clean_dir(v):
-    """'BIO' / 'bio' / 'BIO (Biological Sciences)' -> 'BIO'; None if empty."""
+    """'BIO' / 'bio' / 'BIO (Biological Sciences)' -> 'BIO'; a division code
+    ('AST', 'DMR', 'OAC', ...) -> its directorate; None if empty."""
     if not v:
         return None
     m = re.match(r"\s*([A-Za-z]+)", str(v))
-    return m.group(1).upper() if m else None
+    if not m:
+        return None
+    code = m.group(1).upper()
+    return DIVISION_TO_DIR.get(code, code)
 
 
 def _int(v):
