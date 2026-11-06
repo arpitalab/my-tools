@@ -13,8 +13,12 @@ Usage:
 
     # AI Datasets screening: SOLR descriptions + rubric + solicitation + schema
     python pdf_batch_extract.py solr_descriptions/descriptions \
-        --instructions _best-r06-rubric.md --context "desc-AI datasets.txt" \
-        --schema _best-r06-schema.json
+        --instructions _best-r07-rubric.md --context "desc-AI datasets.txt" \
+        --schema _best-r07-schema.json --out output/ai_datasets_r07
+
+    # noise check: re-score a sample with sampling on (see noise_check.py)
+    python pdf_batch_extract.py solr_descriptions/descriptions --ids sample_ids.txt \
+        --temperature 0.7 --seed 1 --out output/r07_rerun1 ...same rubric options...
 
 Re-running resumes: files that already have a .json are skipped (--force redoes them).
 all.jsonl holds only the results for the files given in this run.
@@ -47,7 +51,9 @@ from pathlib import Path
 import requests
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-THINK = False  # set by --think
+THINK = False  # set by --think; None = don't send the option (models without a thinking mode)
+TEMPERATURE = 0.0  # set by --temperature
+SEED = None        # set by --seed
 WORKERS = 1    # set by --workers; >1 prefixes log lines with the proposal name
 _print_lock = threading.Lock()
 _stats = threading.local()  # per-proposal token/time totals, reset in run_one
@@ -125,11 +131,14 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
         "model": model,
         "messages": messages,
         "stream": False,
-        "options": {"num_ctx": num_ctx, "num_predict": num_predict, "temperature": 0.0},
-        # Gemma 4 is a thinking model; with thinking on, Ollama can route the
-        # whole reply into message.thinking and leave message.content empty.
-        "think": THINK,
+        "options": {"num_ctx": num_ctx, "num_predict": num_predict, "temperature": TEMPERATURE},
     }
+    if SEED is not None:
+        body["options"]["seed"] = SEED
+    # Gemma 4 is a thinking model; with thinking on, Ollama can route the
+    # whole reply into message.thinking and leave message.content empty.
+    if THINK is not None:
+        body["think"] = THINK
     if fmt is not None:
         body["format"] = fmt  # "json" or a JSON-schema dict
     waits = [30, 60, 120, 300]  # Ollama down/restarting or overloaded
@@ -145,6 +154,9 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
             problem = f"{type(e).__name__}"
         warn(f"    ! Ollama {problem}; retrying in {waits[attempt]}s")
         time.sleep(waits[attempt])
+    if r.status_code == 400 and "think" in body and "think" in r.text.lower():
+        body.pop("think")  # this model has no thinking option; ask again without it
+        r = requests.post(OLLAMA_URL, json=body, timeout=timeout)
     if not r.ok:
         raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:300]}")
     data = r.json()
@@ -372,6 +384,10 @@ def main():
                     help="PDFs longer than this are summarized in chunks first (~4 chars/token)")
     ap.add_argument("--retries", type=int, default=2)
     ap.add_argument("--think", action="store_true", help="enable model thinking (off by default)")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="sampling temperature (default 0 = repeatable; e.g. 0.7 for a noise check)")
+    ap.add_argument("--seed", type=int, default=None, help="sampling seed (with --temperature > 0)")
+    ap.add_argument("--ids", help="file of proposal IDs (one per line); score only those inputs")
     ap.add_argument("--batch-size", type=int, default=25,
                     help="refresh all.jsonl and failed.txt after every N proposals")
     ap.add_argument("--limit", type=int, default=0, help="stop after N new proposals (0 = all)")
@@ -380,8 +396,9 @@ def main():
     ap.add_argument("--max-consecutive-failures", type=int, default=5,
                     help="stop the run after this many failures in a row (Ollama down?)")
     args = ap.parse_args()
-    global THINK, WORKERS
+    global THINK, WORKERS, TEMPERATURE, SEED
     THINK = args.think
+    TEMPERATURE, SEED = args.temperature, args.seed
     WORKERS = max(1, args.workers)
 
     instructions = Path(args.instructions).read_text()
@@ -407,6 +424,12 @@ def main():
     pdfs = collect_pdfs(args.pdfs)
     if not pdfs:
         sys.exit(f"no .pdf or .txt files found in {args.pdfs}")
+    if args.ids:
+        want_ids = {ln.split()[0] for ln in Path(args.ids).read_text().splitlines() if ln.strip()}
+        pdfs = [p for p in pdfs if p.stem in want_ids]
+        missing = want_ids - {p.stem for p in pdfs}
+        print(f"--ids: {len(pdfs)} of {len(want_ids)} listed IDs found in the inputs"
+              + (f" (missing e.g. {', '.join(sorted(missing)[:5])})" if missing else ""))
     wanted = {p.stem for p in pdfs}
     def scored(p):  # a .json that won't parse (e.g. from an old crash) counts as not scored
         try:
