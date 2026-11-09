@@ -71,7 +71,8 @@ def stats_line() -> str:
         return ""
     in_s, out_s = g("prompt_eval_duration") / 1e9, g("eval_duration") / 1e9
     rate = f" ({g('eval_count') / out_s:.0f} tok/s)" if out_s else ""
-    return (f"in {g('prompt_eval_count') / 1000:.1f}K tok {in_s:.0f}s · "
+    read = f"in {g('prompt_eval_count') / 1000:.1f}K tok" if g("prompt_eval_count") else "reading"
+    return (f"{read} {in_s:.0f}s · "
             f"out {g('eval_count') / 1000:.1f}K tok {out_s:.0f}s{rate}")
 
 
@@ -144,6 +145,7 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, json_reply=False, t
         body["format"] = fmt  # "json" or a JSON-schema dict
     waits = [30, 60, 120, 300]  # Ollama down/restarting or overloaded
     for attempt in range(len(waits) + 1):
+        t_req = time.time()
         try:
             r = requests.post(OLLAMA_URL, json=body, timeout=timeout, stream=body["stream"])
             if r.status_code not in (500, 502, 503) or attempt == len(waits):
@@ -157,10 +159,11 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, json_reply=False, t
         time.sleep(waits[attempt])
     if r.status_code == 400 and "think" in body and "think" in r.text.lower():
         body.pop("think")  # this model has no thinking option; ask again without it
+        t_req = time.time()
         r = requests.post(OLLAMA_URL, json=body, timeout=timeout, stream=body["stream"])
     if not r.ok:
         raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:300]}")
-    data = _read_stream(r) if body["stream"] else r.json()
+    data = _read_stream(r, t_req) if body["stream"] else r.json()
     _add_stats(data)
     msg = data.get("message", {})
     content = msg.get("content", "")
@@ -175,17 +178,19 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, json_reply=False, t
     return content
 
 
-def _read_stream(r) -> dict:
+def _read_stream(r, t_req: float) -> dict:
     """Collect a streamed /api/chat reply into one dict like the non-streamed one,
     closing the connection (which stops Ollama) once the JSON object is complete."""
     content, thinking, end, last = [], [], _ObjectEnd(), {}
-    t0, n, beat = time.time(), 0, time.time()
+    t0, n, beat, t_first = t_req, 0, time.time(), None
     try:
         for line in r.iter_lines():
             if not line:
                 continue
             last = json.loads(line)
             m = last.get("message") or {}
+            if t_first is None and (m.get("content") or m.get("thinking")):
+                t_first = time.time()  # the model has finished reading the prompt
             if m.get("thinking"):
                 thinking.append(m["thinking"])
             if m.get("content"):
@@ -205,8 +210,11 @@ def _read_stream(r) -> dict:
     data["message"] = {"content": "".join(content), "thinking": "".join(thinking)}
     if end.done and not last.get("done"):  # stopped early: Ollama sent no final stats
         data["done_reason"] = "stop"
+        t_first = t_first or time.time()
         data.setdefault("eval_count", n)
-        data.setdefault("eval_duration", int((time.time() - t0) * 1e9))
+        data.setdefault("eval_duration", int((time.time() - t_first) * 1e9))
+        # time to the first token ~ time spent reading the prompt (token count unknown)
+        data.setdefault("prompt_eval_duration", int((t_first - t0) * 1e9))
     return data
 
 
