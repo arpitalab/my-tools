@@ -22,6 +22,9 @@ Usage:
     python score_critic.py combine output/critic_gemma output/critic_mistral \\
         --noise output/r07_rerun1/noise_report.csv
 
+    # one screen: quote accuracy, agreement, one-sided dimensions, what to spot-check
+    python score_critic.py report output/critic_gemma output/critic_mistral
+
 Outputs (run): <out>/<id>.json per proposal (critic reply + quote checks),
 <out>/critic_summary.csv (one row per proposal and dimension), and a summary
 printed at the end. Re-running resumes; --force redoes proposals.
@@ -479,6 +482,85 @@ def cmd_combine(args):
         print("a dimension whose reruns agree < ~70% of the time is noisy: disputes there are weak evidence")
 
 
+def cmd_report(args):
+    """One screen with what to look at: quote accuracy, how often each critic
+    agrees, backed disputes by dimension and direction, evidence type, and the
+    proposals to spot-check."""
+    dim_order = lambda d: (d == "overall", int(d[1:]) if d[1:].isdigit() else 99)
+    per_critic = {}
+    for folder in args.critics:
+        f = Path(folder) / "critic_summary.csv"
+        if not f.is_file():
+            sys.exit(f"{f} not found")
+        with open(f) as fh:
+            per_critic[Path(folder).name] = list(csv.DictReader(fh))
+    for name, rows in per_critic.items():
+        dims = [r for r in rows if r["dimension"] != "overall"]
+        nq = sum(int(r["quotes"] or 0) for r in dims)
+        nf = sum(int(r["quotes_found"] or 0) for r in dims)
+        acc = nf / nq if nq else None
+        print(f"\n=== {name}: {len({r['id'] for r in rows})} proposals")
+        flag = "" if acc is None else ("  (good)" if acc >= .85 else "  (LOW: weigh this critic's verdicts lightly)"
+                                       if acc < .70 else "  (fair)")
+        print(f"1. quotes found in the proposal: {nf} of {nq}"
+              + (f" = {acc:.0%}{flag}" if acc is not None else ""))
+        print("2./3. per dimension: % supported, backed disputes too high / too low, evidence type")
+        by = defaultdict(list)
+        for r in rows:
+            by[r["dimension"]].append(r)
+        for d in sorted(by, key=dim_order):
+            g = by[d]
+            sup = sum(r["verdict"] == "supported" for r in g) / len(g)
+            if d == "overall":
+                hi = sum(r["verdict"] == "too high" for r in g)
+                lo = sum(r["verdict"] == "too low" for r in g)
+                print(f"   {d:<8} {sup:>4.0%} supported   too high {hi:>2} / too low {lo:>2}  (overall: not quote-checked)")
+                continue
+            cred = [r for r in g if r["credible"] == "True"]
+            hi = sum(r["verdict"] == "too high" for r in cred)
+            lo = sum(r["verdict"] == "too low" for r in cred)
+            basis = Counter(r["basis"] for r in cred)
+            note = ""
+            if sup > .95:
+                note = "  <- almost always agrees (rubber-stamping?)"
+            elif sup < .5:
+                note = "  <- disagrees with most scores"
+            elif max(hi, lo) >= max(5, len(g) // 6) and min(hi, lo) <= max(hi, lo) // 4:
+                note = f"  <- one-sided: scores look systematically too {'high' if hi > lo else 'low'}"
+            print(f"   {d:<8} {sup:>4.0%} supported   too high {hi:>2} / too low {lo:>2}   "
+                  f"quote {basis['quote']:>2}, absence {basis['absence']:>2}{note}")
+    if len(per_critic) > 1:
+        keyed = {n: {(r["id"], r["dimension"]): r for r in rows} for n, rows in per_critic.items()}
+        keys = set.intersection(*(set(k) for k in keyed.values()))
+        both = defaultdict(Counter)
+        for key in keys:
+            if key[1] == "overall":
+                continue
+            rs = [keyed[n][key] for n in keyed]
+            if all(r["credible"] == "True" for r in rs) and len({r["verdict"] for r in rs}) == 1:
+                both[key[1]][rs[0]["verdict"]] += 1
+        print(f"\n4. disputes where every critic ({', '.join(keyed)}) agrees on the direction:")
+        if both:
+            for d in sorted(both, key=dim_order):
+                c = both[d]
+                print(f"   {d:<8} too high {c['too high']:>2} / too low {c['too low']:>2}"
+                      + ("   <- worth a rubric look" if max(c.values()) >= 5 else ""))
+        else:
+            print("   none: the critics never agree on a dispute; the scores hold up")
+    dfile = Path(args.critics[0]) / "disputes.csv"
+    if dfile.is_file():
+        with open(dfile) as fh:
+            rows = [r for r in csv.DictReader(fh) if r["agree_on_direction"] == "True"]
+        if rows:
+            print(f"\n7. spot-check these first (full critiques with quotes in {Path(args.critics[0])}/<id>.json):")
+            for r in rows[:args.top]:
+                v = next((r[k] for k in r if k.endswith("_verdict")), "")
+                reason = next((r[k] for k in r if k.endswith("_reason")), "")
+                print(f"   {r['id']} {r['dimension']} (stored {r['stored']}): {v}; {reason[:110]}")
+    elif len(per_critic) > 1:
+        print("\n(run `score_critic.py combine ...` first for the spot-check list)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -503,11 +585,14 @@ def main():
     c = sub.add_parser("combine", help="merge critics into one dispute list")
     c.add_argument("critics", nargs="+", help="critic output folders")
     c.add_argument("--noise", help="noise_report.csv from noise_check.py compare")
+    rp = sub.add_parser("report", help="one-screen summary of what to look at")
+    rp.add_argument("critics", nargs="+", help="critic output folders (combine first for the spot-check list)")
+    rp.add_argument("--top", type=int, default=8, help="how many disputes to list for spot-checking")
     args = ap.parse_args()
     if args.cmd == "run" and args.think == "auto":
         m = args.model.lower()
         args.think = "off" if m.startswith("gemma") else "low" if m.startswith("gpt-oss") else "omit"
-    {"run": cmd_run, "combine": cmd_combine}[args.cmd](args)
+    {"run": cmd_run, "combine": cmd_combine, "report": cmd_report}[args.cmd](args)
 
 
 if __name__ == "__main__":
