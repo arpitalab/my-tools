@@ -130,7 +130,8 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
     body = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        # JSON replies are streamed so generation can be stopped at the closing brace
+        "stream": fmt is not None,
         "options": {"num_ctx": num_ctx, "num_predict": num_predict, "temperature": TEMPERATURE},
     }
     if SEED is not None:
@@ -144,7 +145,7 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
     waits = [30, 60, 120, 300]  # Ollama down/restarting or overloaded
     for attempt in range(len(waits) + 1):
         try:
-            r = requests.post(OLLAMA_URL, json=body, timeout=timeout)
+            r = requests.post(OLLAMA_URL, json=body, timeout=timeout, stream=body["stream"])
             if r.status_code not in (500, 502, 503) or attempt == len(waits):
                 break
             problem = f"HTTP {r.status_code}: {r.text[:150]}"
@@ -156,10 +157,10 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
         time.sleep(waits[attempt])
     if r.status_code == 400 and "think" in body and "think" in r.text.lower():
         body.pop("think")  # this model has no thinking option; ask again without it
-        r = requests.post(OLLAMA_URL, json=body, timeout=timeout)
+        r = requests.post(OLLAMA_URL, json=body, timeout=timeout, stream=body["stream"])
     if not r.ok:
         raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:300]}")
-    data = r.json()
+    data = _read_stream(r) if body["stream"] else r.json()
     _add_stats(data)
     msg = data.get("message", {})
     content = msg.get("content", "")
@@ -174,17 +175,73 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
     return content
 
 
-def parse_json(s: str):
-    """json.loads with light repair: strip fences, take outermost {...}."""
+def _read_stream(r) -> dict:
+    """Collect a streamed /api/chat reply into one dict like the non-streamed one,
+    closing the connection (which stops Ollama) once the JSON object is complete."""
+    content, thinking, end, last = [], [], _ObjectEnd(), {}
+    t0, n = time.time(), 0
     try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        pass
-    s2 = re.sub(r"^```(?:json)?\s*|\s*```$", "", s.strip())
-    start, end = s2.find("{"), s2.rfind("}")
-    if start != -1 and end > start:
-        return json.loads(s2[start : end + 1])  # may still raise
-    raise json.JSONDecodeError("no JSON object found", s, 0)
+        for line in r.iter_lines():
+            if not line:
+                continue
+            last = json.loads(line)
+            m = last.get("message") or {}
+            if m.get("thinking"):
+                thinking.append(m["thinking"])
+            if m.get("content"):
+                content.append(m["content"])
+                end.feed(m["content"])
+                n += 1
+            if last.get("done") or end.done:
+                break
+    finally:
+        r.close()
+    data = dict(last)
+    data["message"] = {"content": "".join(content), "thinking": "".join(thinking)}
+    if end.done and not last.get("done"):  # stopped early: Ollama sent no final stats
+        data["done_reason"] = "stop"
+        data.setdefault("eval_count", n)
+        data.setdefault("eval_duration", int((time.time() - t0) * 1e9))
+    return data
+
+
+def parse_json(s: str):
+    """The first complete {...} in the reply. Strips fences and ignores anything the
+    model wrote after the object (gemma sometimes keeps going past the closing brace)."""
+    s2 = re.sub(r"^```(?:json)?\s*", "", s.strip())
+    start = s2.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("no JSON object found", s, 0)
+    obj, _ = json.JSONDecoder().raw_decode(s2, start)  # may still raise
+    return obj
+
+
+class _ObjectEnd:
+    """Feed streamed text; .done turns True once the first top-level {...} closes."""
+
+    def __init__(self):
+        self.depth, self.in_str, self.esc, self.started, self.done = 0, False, False, False, False
+
+    def feed(self, text: str):
+        for ch in text:
+            if self.done:
+                return
+            if self.in_str:
+                if self.esc:
+                    self.esc = False
+                elif ch == "\\":
+                    self.esc = True
+                elif ch == '"':
+                    self.in_str = False
+            elif ch == '"' and self.started:
+                self.in_str = True
+            elif ch == "{":
+                self.depth += 1
+                self.started = True
+            elif ch == "}" and self.started:
+                self.depth -= 1
+                if self.depth == 0:
+                    self.done = True
 
 
 # --------------------------------------------------------------------------- #
