@@ -298,13 +298,16 @@ def load_manifest_meta(desc_dir: str, mtime: float) -> pd.DataFrame:
         f = Path(desc_dir).parent / name
         if f.exists():
             part = pd.read_csv(f, dtype=str).fillna("")
-            if "status" in part:
-                part = part[part["status"] == "ok"]
-            parts.append(part)
+            if "status" in part:  # pdf_text: SOLR metadata for a proposal whose text came from a PDF
+                part = part[part["status"].isin(["ok", "pdf_text"])]
+            parts.append(part[part["id"] != ""].drop_duplicates("id").set_index("id"))
     if not parts:
         return pd.DataFrame(columns=["id"])
-    m = pd.concat(parts, ignore_index=True).fillna("")
-    m = m[m["id"] != ""].drop_duplicates("id", keep="first")  # SOLR row first
+    # field by field: SOLR's value where it has one, else the PDF sheet's
+    m = parts[0].replace("", pd.NA)
+    for part in parts[1:]:
+        m = m.combine_first(part.replace("", pd.NA))
+    m = m.fillna("").reset_index()
     out = pd.DataFrame({"id": m["id"]})
     if "pi_name" in m:
         out["PI"] = m["pi_name"]

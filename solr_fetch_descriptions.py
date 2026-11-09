@@ -255,31 +255,39 @@ def main():
     meta_path = out / "meta.jsonl"
     meta = {} if args.force else load_meta(meta_path)
 
-    # IDs whose text came from PDFs (pdf_to_descriptions.py) are left alone, so
-    # SOLR doesn't overwrite text that was already scored or move their files
+    # IDs whose text came from PDFs (pdf_to_descriptions.py): their text is left
+    # alone, so SOLR doesn't overwrite text that was already scored or move their
+    # files, but SOLR's metadata (months, concurrence, status, ...) is still
+    # fetched for them (status "pdf_text" in manifest.csv)
+    pdf_ids = set()
     pdf_man = out / "pdf_manifest.csv"
     if pdf_man.exists() and not args.force:
         with open(pdf_man) as f:
             from_pdf = {r["id"] for r in csv.DictReader(f) if r.get("status") == "ok"}
-        skip = [i for i in ids if i in from_pdf and meta.get(i, {}).get("status") != "ok"]
-        if skip:
-            ids = [i for i in ids if i not in set(skip)]
-            print(f"{len(skip)} IDs already have text from PDFs (pdf_manifest.csv); skipping them "
-                  "(--force to fetch from SOLR anyway)")
+        pdf_ids = {i for i in ids if i in from_pdf and meta.get(i, {}).get("status") != "ok"}
+        if pdf_ids:
+            print(f"{len(pdf_ids)} IDs have text from PDFs (pdf_manifest.csv): their text is left "
+                  "alone and only SOLR metadata is fetched for them (--force to fetch text too)")
+        for i in pdf_ids:
+            if meta.get(i, {}).get("status") != "pdf_text":
+                meta[i] = {"id": i, "status": "pdf_text", "title": "", "chars": 0}
 
     # retry anything not yet fetched OK (incl. failed batches / not-yet-indexed),
     # and anything logged as OK whose .txt has since been deleted
     have = lambda i: (desc_dir / f"{i}.txt").exists() or (collab_dir / f"{i}.txt").exists()
-    todo = [i for i in ids if meta.get(i, {}).get("status") != "ok" or not have(i)]
-    print(f"{len(ids)} IDs; {len(ids) - len(todo)} already fetched; {len(todo)} to fetch "
-          f"in batches of {args.batch_size}")
+    todo = [i for i in ids if i not in pdf_ids
+            and (meta.get(i, {}).get("status") != "ok" or not have(i))]
+    print(f"{len(ids)} IDs; {len(ids) - len(todo) - len(pdf_ids)} already fetched"
+          + (f", {len(pdf_ids)} from PDFs" if pdf_ids else "")
+          + f"; {len(todo)} to fetch in batches of {args.batch_size}")
 
     meta_fields = [x.strip() for x in args.meta_fields.split(",") if x.strip()]
     concur_fields = [x.strip() for x in args.concurrence_fields.split(",") if x.strip()]
     # downloaded by an older version: fetch only the metadata, not the description again
     meta_todo = [i for i in ids if i not in todo and not meta[i].get("meta_ok")]
     if meta_todo:
-        print(f"{len(meta_todo)} already-downloaded IDs need PI/institution/amount metadata")
+        print(f"{len(meta_todo)} IDs need SOLR metadata only (PI, institution, amount, months, "
+              "concurrence, ...)")
 
     solr = pysolr.Solr(f"{SOLR_BASE}/{args.database}/", timeout=args.timeout)
     if args.diagnose:
@@ -335,7 +343,7 @@ def main():
             if b + 1 < n_batches:
                 time.sleep(args.pause)
 
-        meta_only = ",".join(dict.fromkeys(["id"] + meta_fields))
+        meta_only = ",".join(dict.fromkeys(["id", "title"] + meta_fields))
         for b in range(0, len(meta_todo), args.batch_size):
             batch = meta_todo[b:b + args.batch_size]
             try:
@@ -349,6 +357,8 @@ def main():
                 pid = str(d.get("id"))
                 if pid in meta:
                     meta[pid].update(meta_from_doc(d, meta_fields, concur))
+                    if meta[pid].get("status") == "pdf_text":
+                        meta[pid]["title"] = as_text(d.get("title")).strip()
                     mf.write(json.dumps(meta[pid]) + "\n")
             mf.flush()
             print(f"[metadata {b // args.batch_size + 1}/{(len(meta_todo) + args.batch_size - 1) // args.batch_size}] "
@@ -415,9 +425,9 @@ def main():
         w.writeheader()
         w.writerows(rwr)
 
-    missing = [r["id"] for r in rows if r["status"] != "ok"]
+    missing = [r["id"] for r in rows if r["status"] not in ("ok", "pdf_text")]
     (out / "missing_ids.txt").write_text("".join(f"{r['id']}\t{r['status']}\n" for r in rows
-                                                 if r["status"] != "ok"))
+                                                 if r["status"] not in ("ok", "pdf_text")))
     n_desc = len(list(desc_dir.glob("*.txt")))
     n_set_aside = len(list(collab_dir.glob("*.txt")))
     print(f"\ndone: {n_desc} descriptions ready to score in {desc_dir}"
@@ -427,11 +437,15 @@ def main():
                 "keep": "all kept for scoring"}[args.collab]
         print(f"{len(rwr)} collaborative proposal(s) found ({verb}); "
               f"listed in {out / 'collaborative_rwr.csv'}")
+    if pdf_ids:
+        got = sum(1 for i in pdf_ids if meta.get(i, {}).get("meta_ok"))
+        print(f"SOLR metadata for PDF-text IDs: {got} of {len(pdf_ids)}"
+              + ("" if got == len(pdf_ids) else " (the rest aren't in SOLR yet; re-run later)"))
     not_run = len(ids) - len(rows)
     if not_run:
         print(f"{not_run} IDs not attempted yet; re-run to continue")
     if missing:
-        st = Counter(r["status"] for r in rows if r["status"] != "ok")
+        st = Counter(r["status"] for r in rows if r["status"] not in ("ok", "pdf_text"))
         why = {"error": "SOLR request failed (timeout/network); re-run to retry",
                "not_found": "SOLR has no proposal with that ID (not loaded yet, or wrong ID)",
                "no_description": "SOLR has the proposal but no description text"}
