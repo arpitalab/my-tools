@@ -126,12 +126,12 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Ollama
 # --------------------------------------------------------------------------- #
-def chat(model, messages, *, num_ctx, num_predict, fmt=None, timeout=900):
+def chat(model, messages, *, num_ctx, num_predict, fmt=None, json_reply=False, timeout=900):
     body = {
         "model": model,
         "messages": messages,
         # JSON replies are streamed so generation can be stopped at the closing brace
-        "stream": fmt is not None,
+        "stream": json_reply,
         "options": {"num_ctx": num_ctx, "num_predict": num_predict, "temperature": TEMPERATURE},
     }
     if SEED is not None:
@@ -179,7 +179,7 @@ def _read_stream(r) -> dict:
     """Collect a streamed /api/chat reply into one dict like the non-streamed one,
     closing the connection (which stops Ollama) once the JSON object is complete."""
     content, thinking, end, last = [], [], _ObjectEnd(), {}
-    t0, n = time.time(), 0
+    t0, n, beat = time.time(), 0, time.time()
     try:
         for line in r.iter_lines():
             if not line:
@@ -192,6 +192,11 @@ def _read_stream(r) -> dict:
                 content.append(m["content"])
                 end.feed(m["content"])
                 n += 1
+            if time.time() - beat >= 60:
+                beat = time.time()
+                el = beat - t0
+                warn(f"    ... {n} tokens so far in {el / 60:.0f} min ({n / el:.1f} tok/s"
+                     + (", still thinking" if thinking and not content else "") + ")")
             if last.get("done") or end.done:
                 break
     finally:
@@ -376,12 +381,15 @@ def process_pdf(pdf: Path, instructions: str, schema, args):
               "No markdown fences, no commentary.")},
         {"role": "user", "content": f"{label} ({pdf.name}):\n\n{material}"},
     ]
-    fmt = schema if schema is not None else "json"
+    # --format schema: Ollama enforces the full schema (reliable, but its token-by-token
+    # check can be very slow with gemma's large vocabulary); json: only "valid JSON";
+    # none: no constraint, the checks below catch mistakes and retry.
+    fmt = {"schema": schema if schema is not None else "json", "json": "json", "none": None}[args.format]
 
     raw, last_ok = "", None
     for attempt in range(1, args.retries + 2):
         raw = chat(args.model, messages, num_ctx=args.num_ctx,
-                   num_predict=args.num_predict, fmt=fmt)
+                   num_predict=args.num_predict, fmt=fmt, json_reply=True)
         try:
             result = parse_json(raw)
         except json.JSONDecodeError as e:
@@ -437,6 +445,10 @@ def main():
     ap.add_argument("--out", default="./output/pdf_json")
     ap.add_argument("--num-ctx", type=int, default=32768)
     ap.add_argument("--num-predict", type=int, default=4096, help="max output tokens for the JSON")
+    ap.add_argument("--format", choices=("schema", "json", "none"), default="schema",
+                    help="what Ollama enforces while generating: the full --schema (default), "
+                         "just valid JSON, or nothing. json/none are much faster when the schema "
+                         "check is slow; the reply is still validated against --schema afterwards")
     ap.add_argument("--chunk-chars", type=int, default=60000,
                     help="PDFs longer than this are summarized in chunks first (~4 chars/token)")
     ap.add_argument("--retries", type=int, default=2)
