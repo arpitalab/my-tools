@@ -54,6 +54,7 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 THINK = False  # set by --think; None = don't send the option (models without a thinking mode)
 TEMPERATURE = 0.0  # set by --temperature
 SEED = None        # set by --seed
+NUM_BATCH = None  # set by --num-batch; Ollama's default (512) when None
 WORKERS = 1    # set by --workers; >1 prefixes log lines with the proposal name
 _print_lock = threading.Lock()
 _stats = threading.local()  # per-proposal token/time totals, reset in run_one
@@ -137,6 +138,8 @@ def chat(model, messages, *, num_ctx, num_predict, fmt=None, json_reply=False, t
     }
     if SEED is not None:
         body["options"]["seed"] = SEED
+    if NUM_BATCH:
+        body["options"]["num_batch"] = NUM_BATCH
     # Gemma 4 is a thinking model; with thinking on, Ollama can route the
     # whole reply into message.thinking and leave message.content empty.
     if THINK is not None:
@@ -453,6 +456,9 @@ def main():
     ap.add_argument("--out", default="./output/pdf_json")
     ap.add_argument("--num-ctx", type=int, default=32768)
     ap.add_argument("--num-predict", type=int, default=4096, help="max output tokens for the JSON")
+    ap.add_argument("--num-batch", type=int,
+                    help="prompt tokens Ollama processes per step (Ollama default 512); 1024 or 2048 "
+                         "can read long proposals faster on Apple GPUs. Changing it reloads the model")
     ap.add_argument("--format", choices=("schema", "json", "none"), default="schema",
                     help="what Ollama enforces while generating: the full --schema (default), "
                          "just valid JSON, or nothing. json/none are much faster when the schema "
@@ -473,10 +479,11 @@ def main():
     ap.add_argument("--max-consecutive-failures", type=int, default=5,
                     help="stop the run after this many failures in a row (Ollama down?)")
     args = ap.parse_args()
-    global THINK, WORKERS, TEMPERATURE, SEED
+    global THINK, WORKERS, TEMPERATURE, SEED, NUM_BATCH
     THINK = args.think
     TEMPERATURE, SEED = args.temperature, args.seed
     WORKERS = max(1, args.workers)
+    NUM_BATCH = args.num_batch
 
     instructions = Path(args.instructions).read_text()
     for c in args.context:
