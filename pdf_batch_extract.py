@@ -456,6 +456,9 @@ def main():
     ap.add_argument("--out", default="./output/pdf_json")
     ap.add_argument("--num-ctx", type=int, default=32768)
     ap.add_argument("--num-predict", type=int, default=4096, help="max output tokens for the JSON")
+    ap.add_argument("--ollama-url", default="http://localhost:11434",
+                    help="Ollama server to use, e.g. http://<other-mac>:11434 for a second machine "
+                         "started with OLLAMA_HOST=0.0.0.0 ollama serve")
     ap.add_argument("--num-batch", type=int,
                     help="prompt tokens Ollama processes per step (Ollama default 512); 1024 or 2048 "
                          "can read long proposals faster on Apple GPUs. Changing it reloads the model")
@@ -479,11 +482,12 @@ def main():
     ap.add_argument("--max-consecutive-failures", type=int, default=5,
                     help="stop the run after this many failures in a row (Ollama down?)")
     args = ap.parse_args()
-    global THINK, WORKERS, TEMPERATURE, SEED, NUM_BATCH
+    global THINK, WORKERS, TEMPERATURE, SEED, NUM_BATCH, OLLAMA_URL
     THINK = args.think
     TEMPERATURE, SEED = args.temperature, args.seed
     WORKERS = max(1, args.workers)
     NUM_BATCH = args.num_batch
+    OLLAMA_URL = args.ollama_url.rstrip("/").removesuffix("/api/chat") + "/api/chat"
 
     instructions = Path(args.instructions).read_text()
     for c in args.context:
@@ -493,7 +497,7 @@ def main():
     if ver is None:
         print(f"! can't reach Ollama at {OLLAMA_URL}; is it running?", file=sys.stderr)
     else:
-        print(f"Ollama {ver}, model {args.model}" + (f", schema {args.schema}" if schema else ""))
+        print(f"Ollama {ver} at {OLLAMA_URL.removesuffix('/api/chat')}, model {args.model}" + (f", schema {args.schema}" if schema else ""))
         if schema is not None and ver_t < (0, 5, 0):
             print("! this Ollama is older than 0.5 and won't enforce --schema; the script will "
                   "still check each reply and retry, but upgrading Ollama is more reliable",
