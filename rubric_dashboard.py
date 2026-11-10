@@ -49,7 +49,7 @@ PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-06c (rule-based overall)"
+DASHBOARD_VERSION = "2026-11-10 (rubric tab)"
 
 
 def newest_results(root="output"):
@@ -59,11 +59,34 @@ def newest_results(root="output"):
     return str(found[0]) if found else "output/ai_datasets/all.jsonl"
 
 
+RUBRIC_DIRS = (".", "~/Downloads/ai_datasets_screening", "~/Downloads")
+
+
+def find_rubric(results_path: str) -> str:
+    """The rubric matching the results folder's version (e.g. 'r08' in
+    output/ai_datasets_r08), else the newest _best-rNN-rubric.md found."""
+    found = {}
+    for d in RUBRIC_DIRS:
+        d = Path(d).expanduser()
+        if d.is_dir():
+            for f in d.glob("_best-r*-rubric.md"):
+                m = re.search(r"-r(\d+)-", f.name)
+                if m:
+                    found.setdefault(int(m.group(1)), f)
+    if not found:
+        return ""
+    m = re.search(r"r(\d+)", Path(results_path).parent.name)
+    if m and int(m.group(1)) in found:
+        return str(found[int(m.group(1))])
+    return str(found[max(found)])
+
+
 def cli_defaults():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default=None, help="default: newest output/**/all.jsonl")
     ap.add_argument("--descriptions", default="solr_descriptions/descriptions")
     ap.add_argument("--metadata", default="")
+    ap.add_argument("--rubric", default=None, help="rubric .md to show (default: matched to the results folder)")
     args, _ = ap.parse_known_args(sys.argv[1:])
     if args.results is None:
         args.results = newest_results()
@@ -533,6 +556,10 @@ def main():
         if meta_path and not Path(meta_path).is_file():
             st.warning(f"ID spreadsheet not found: `{meta_path}` (relative paths are from "
                        f"`{Path.cwd()}`)")
+        rubric_path = st.text_input("Rubric (for the Rubric tab)", defaults.rubric or find_rubric(res_path),
+                                    help="Found automatically from the results folder's version "
+                                         "(r08 -> _best-r08-rubric.md) in this folder, "
+                                         "~/Downloads/ai_datasets_screening or ~/Downloads.")
         ffrdc_path = st.text_input("FFRDC list", str(Path(__file__).parent / "ffrdc_list.csv"))
         others = [str(p) for p in Path("output").rglob("all.jsonl")] if Path("output").is_dir() else []
         if len(others) > 1:
@@ -713,7 +740,7 @@ def main():
         k[5].metric("Interdisciplinary", f"{f['interdisciplinary'].sum()}",
                     f"{f['interdisciplinary'].sum() / n:.0%}", delta_color="off")
 
-    tabs = st.tabs(["Overview", "Domains", "Flags", "Planning", "Proposals", "QA"])
+    tabs = st.tabs(["Overview", "Domains", "Flags", "Planning", "Proposals", "QA", "Rubric"])
 
     # ---- Overview --------------------------------------------------------- #
     with tabs[0]:
@@ -1019,6 +1046,29 @@ def main():
             st.dataframe(qa, hide_index=True, use_container_width=True)
         else:
             st.success("No issues found.")
+
+    # ---- Rubric ----------------------------------------------------------- #
+    with tabs[6]:
+        rp = Path(rubric_path).expanduser() if rubric_path else None
+        if not rp or not rp.is_file():
+            st.info("No rubric file found. Put its path in the sidebar (e.g. "
+                    "`~/Downloads/ai_datasets_screening/_best-r08-rubric.md`).")
+        else:
+            rv = re.search(r"-r(\d+)-", rp.name)
+            fv = re.search(r"r(\d+)", Path(res_path).parent.name)
+            if rv and fv and rv.group(1) != fv.group(1):
+                st.warning(f"The results folder looks like r{fv.group(1)} but this rubric is "
+                           f"r{rv.group(1)}.")
+            st.caption(f"`{rp}`")
+            text = rp.read_text()
+            find = st.text_input("Find in rubric", key="rubric_find")
+            if find:
+                hits = [ln for ln in text.splitlines() if find.lower() in ln.lower()]
+                st.caption(f"{len(hits)} line(s) mention '{find}'")
+                for ln in hits:
+                    st.markdown("- " + ln.lstrip("-# ").replace("$", "\\$"))
+                st.divider()
+            st.markdown(text.replace("$", "\\$"))
 
 
 main()
