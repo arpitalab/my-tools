@@ -471,7 +471,7 @@ def main():
                     help="sampling temperature (default 0 = repeatable; e.g. 0.7 for a noise check)")
     ap.add_argument("--seed", type=int, default=None, help="sampling seed (with --temperature > 0)")
     ap.add_argument("--ids", help="file of proposal IDs (one per line); score only those inputs")
-    ap.add_argument("--batch-size", type=int, default=25,
+    ap.add_argument("--batch-size", type=int, default=5,
                     help="refresh all.jsonl and failed.txt after every N proposals")
     ap.add_argument("--limit", type=int, default=0, help="stop after N new proposals (0 = all)")
     ap.add_argument("--workers", type=int, default=1,
