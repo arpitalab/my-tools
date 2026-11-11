@@ -49,7 +49,7 @@ PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-10 (rubric tab)"
+DASHBOARD_VERSION = "2026-11-11 (other binning)"
 
 
 def newest_results(root="output"):
@@ -86,6 +86,7 @@ def cli_defaults():
     ap.add_argument("--results", default=None, help="default: newest output/**/all.jsonl")
     ap.add_argument("--descriptions", default="solr_descriptions/descriptions")
     ap.add_argument("--metadata", default="")
+    ap.add_argument("--other-binning", default="", help="another directorate binning (.xlsx/.csv) to show alongside")
     ap.add_argument("--rubric", default=None, help="rubric .md to show (default: matched to the results folder)")
     args, _ = ap.parse_known_args(sys.argv[1:])
     if args.results is None:
@@ -310,6 +311,24 @@ def rule_overall(df: pd.DataFrame, dims: list, weights: dict, caps: bool = True)
 def _money(v):
     m = re.search(r"\d[\d,]*(\.\d+)?", str(v or ""))
     return float(m.group(0).replace(",", "")) if m else None
+
+
+@st.cache_data(show_spinner=False)
+def load_other_binning(path: str, mtime: float) -> pd.DataFrame:
+    """Another directorate binning (e.g. a Copilot sheet) -> id, other_dir, other_all,
+    other_confidence. Columns are found the same way as in directorate_compare.py."""
+    import contextlib
+    import io
+    here = str(Path(__file__).resolve().parent)  # streamlit doesn't always put it on the path
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from directorate_compare import load_theirs
+    with contextlib.redirect_stdout(io.StringIO()):
+        rows = load_theirs([path], None, None, None, None, None, False)
+    return pd.DataFrame([{"id": pid, "other_dir": (e["their_dirs"] or [""])[0],
+                          "other_all": "; ".join(e["their_dirs"]), "other_confidence": e["their_confidence"]}
+                         for pid, e in rows.items()],
+                        columns=["id", "other_dir", "other_all", "other_confidence"])
 
 
 @st.cache_data(show_spinner=False)
@@ -560,6 +579,11 @@ def main():
                                     help="Found automatically from the results folder's version "
                                          "(r08 -> _best-r08-rubric.md) in this folder, "
                                          "~/Downloads/ai_datasets_screening or ~/Downloads.")
+        other_path = st.text_input("Other directorate binning (optional)", defaults.other_binning,
+                                   help="An .xlsx/.csv with proposal IDs and a directorate column (e.g. the "
+                                        "Copilot exercise). Shown next to ours in Proposals and Domains.")
+        if other_path and not Path(other_path).expanduser().is_file():
+            st.warning(f"Other binning not found: `{other_path}`")
         ffrdc_path = st.text_input("FFRDC list", str(Path(__file__).parent / "ffrdc_list.csv"))
         others = [str(p) for p in Path("output").rglob("all.jsonl")] if Path("output").is_dir() else []
         if len(others) > 1:
@@ -666,6 +690,22 @@ def main():
                                      else ("" if not str(t).strip() else "Impact/Flagship"))
     df["is_planning"] = (df["declared"] == "Planning") | (df["proposal_type"] == "Planning")
     df["interdisciplinary"] = df["secondary_dirs"].map(bool) & df["primary_dir"].notna()
+    op = Path(other_path).expanduser() if other_path else None
+    has_other = bool(op and op.is_file())
+    if has_other:
+        other = load_other_binning(str(op), op.stat().st_mtime)
+        df = df.merge(other, on="id", how="left")
+        for c in ("other_dir", "other_all", "other_confidence"):
+            df[c] = df[c].fillna("")
+
+        def _agree(r):
+            if not r["other_dir"] or not r["primary_dir"]:
+                return ""
+            if r["other_dir"] == r["primary_dir"]:
+                return "same primary"
+            ours = {r["primary_dir"], *r["secondary_dirs"]}
+            return "theirs among ours" if set(r["other_all"].split("; ")) & ours else "no overlap"
+        df["binning"] = df.apply(_agree, axis=1)
 
     # FFRDC status comes from the table, not the model: the model only names
     # organizations; anything not on ffrdc_list.csv is set aside for review.
@@ -692,6 +732,9 @@ def main():
         dir_pick = st.multiselect("Directorate (primary or secondary)", DIRECTORATES) if has_domain else []
         inter_only = st.checkbox("Only interdisciplinary proposals") if has_domain else False
         plan_pick = st.multiselect("Planning scope", PLAN_ORDER) if has_plan else []
+        bin_pick = st.multiselect("Other binning vs ours", ["same primary", "theirs among ours", "no overlap"],
+                                  help="'theirs among ours': their directorate is one of our secondaries") \
+            if has_other else []
         query = st.text_input("Search title / summary / justifications")
 
     f = df[df["overall"].between(lo, hi) | df["overall"].isna() & (lo == 0)]
@@ -705,6 +748,8 @@ def main():
         f = f[f["interdisciplinary"]]
     if plan_pick:
         f = f[f["plan_level"].isin(plan_pick)]
+    if bin_pick:
+        f = f[f["binning"].isin(bin_pick)]
     if ffrdc_only:
         f = f[f["ffrdc"] == True]  # noqa: E712
     if query:
@@ -772,6 +817,17 @@ def main():
         if not has_domain:
             st.info("These results have no domain fields. Re-run with the updated r05 rubric and schema.")
         else:
+            if has_other:
+                b = f["binning"][f["binning"] != ""]
+                if len(b):
+                    st.caption(f"Other binning, {len(b)} proposals in both: same primary "
+                               f"{(b == 'same primary').mean():.0%}; their directorate among ours "
+                               f"{(b != 'no overlap').mean():.0%}. Use the 'Other binning vs ours' filter "
+                               "to list the differences.")
+                    ct = pd.crosstab(f.loc[b.index, "other_dir"].rename("theirs"),
+                                     f.loc[b.index, "primary_dir"].rename("ours"))
+                    with st.expander("Their primary (rows) x our primary (columns)"):
+                        st.dataframe(ct, use_container_width=True)
             c1, c2 = st.columns(2)
             with c1:
                 show(chart_directorates(f))
@@ -898,6 +954,8 @@ def main():
             cols += ["plan_level"]
         if has_domain:
             cols += ["primary_dir", "secondary_dirs", "field"]
+        if has_other:
+            cols += ["other_dir", "binning"]
         cols += ["overall"] + ([other_col] if len(dims) >= 2 else []) + dims
         if has_flags:
             cols += ["agency_level", "agencies"]
@@ -942,6 +1000,9 @@ def main():
             if has_domain and r["primary_dir"]:
                 dom = " · " + " + ".join([r["primary_dir"]] + list(r["secondary_dirs"]))
                 dom += f" ({r['field']})" if r["field"] else ""
+            if has_other and r["other_dir"]:
+                dom += f" · other binning: {r['other_all']}" + (
+                    f" ({r['other_confidence']})" if r["other_confidence"] else "")
             st.caption(f"{pick} · {r['proposal_type']} · overall {r['overall']}{dom}"
                        + (f" · {meta_line}" if meta_line else ""))
             st.write(r["summary"] or "_No summary in this result._")
