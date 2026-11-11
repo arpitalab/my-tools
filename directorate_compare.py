@@ -9,10 +9,12 @@ with the directorates in our rubric scoring.
         --ours output/ai_datasets_r08 output/ai_datasets_r07 --out output/dir_compare
 
 Columns are found automatically: the ID column is the one with the most 7-digit
-proposal IDs, the directorate column the one whose values most often look like
-directorate codes/names, and a keyword column is any column with "keyword" (or
-"term"/"topic") in its name. Override with --id-col / --dir-col / --kw-col, and
-pick a sheet with --sheet (default: every sheet).
+proposal IDs; the directorate column is one named "directorate", else the one whose
+values most often look like directorate codes/names; every column with "keyword"
+(or "term"/"topic") in its name is kept (e.g. PI keywords and Copilot keywords);
+columns named "division" and "confidence" are carried along, and agreement is
+reported by confidence level. Override with --id-col / --dir-col / --kw-col
+(repeatable) / --conf-col, and pick a sheet with --sheet (default: every sheet).
 
 Their cell may list several directorates ("CISE; MPS"): the first is taken as
 their primary. Ours: domain.primary_directorate and secondary_directorates from
@@ -85,22 +87,27 @@ def clean_id(v):
     return s if re.fullmatch(r"\d{7}", s) else None
 
 
-def pick_cols(df, id_col, dir_col, kw_col):
+def pick_cols(df, id_col, dir_col, kw_cols, conf_col):
     def score(col, f):
         vals = df[col].dropna().astype(str).head(500)
         return sum(bool(f(v)) for v in vals)
+    named = lambda pat: [c for c in df.columns if re.search(pat, str(c), re.I)]
     idc = id_col or max(df.columns, key=lambda c: score(c, clean_id))
     if score(idc, clean_id) == 0:
-        return None, None, None
+        return None, None, [], None, None
     rest = [c for c in df.columns if c != idc]
-    dc = dir_col or (max(rest, key=lambda c: score(c, to_dirs)) if rest else None)
-    if dc is not None and not dir_col and score(dc, to_dirs) == 0:
-        dc = None
-    kc = kw_col or next((c for c in rest if re.search(r"keyword|term|topic", str(c), re.I)), None)
-    return idc, dc, kc
+    dc = dir_col or next(iter(named(r"directorate")), None)
+    if dc is None and rest:
+        dc = max(rest, key=lambda c: score(c, to_dirs))
+        if score(dc, to_dirs) == 0:
+            dc = None
+    kcs = kw_cols or named(r"keyword|term|topic")
+    divc = next((c for c in named(r"division") if c != dc), None)
+    cc = conf_col or next(iter(named(r"confiden")), None)
+    return idc, dc, kcs, divc, cc
 
 
-def load_theirs(paths, sheet, id_col, dir_col, kw_col, dry):
+def load_theirs(paths, sheet, id_col, dir_col, kw_cols, conf_col, dry):
     rows = {}
     for path in paths:
         sheets = pd.read_excel(path, sheet_name=sheet if sheet else None, dtype=str) \
@@ -108,9 +115,10 @@ def load_theirs(paths, sheet, id_col, dir_col, kw_col, dry):
         if isinstance(sheets, pd.DataFrame):
             sheets = {sheet: sheets}
         for name, df in sheets.items():
-            idc, dc, kc = pick_cols(df, id_col, dir_col, kw_col)
+            idc, dc, kcs, divc, cc = pick_cols(df, id_col, dir_col, kw_cols, conf_col)
             print(f"{Path(path).name} [{name}]: {len(df)} rows; columns: {list(df.columns)}")
-            print(f"    using id={idc!r} directorate={dc!r} keywords={kc!r}")
+            print(f"    using id={idc!r} directorate={dc!r} keywords={kcs!r} division={divc!r} "
+                  f"confidence={cc!r}")
             if dry or idc is None:
                 if idc is None:
                     print("    (no column of 7-digit IDs; skipped)")
@@ -122,12 +130,17 @@ def load_theirs(paths, sheet, id_col, dir_col, kw_col, dry):
                 pid = clean_id(r[idc])
                 if not pid:
                     continue
-                e = rows.setdefault(pid, {"their_dirs": [], "their_keywords": "", "their_raw": ""})
+                e = rows.setdefault(pid, {"their_dirs": [], "their_raw": "", "their_division": "",
+                                          "their_confidence": "", "keywords": {}})
+                val = lambda c: "" if c is None or pd.isna(r[c]) else str(r[c]).strip()
                 if dc is not None and not e["their_dirs"]:
                     e["their_dirs"] = to_dirs(r[dc])
-                    e["their_raw"] = "" if pd.isna(r[dc]) else str(r[dc])
-                if kc is not None and not e["their_keywords"] and not pd.isna(r[kc]):
-                    e["their_keywords"] = str(r[kc])
+                    e["their_raw"] = val(dc)
+                for kc in kcs:
+                    if val(kc):
+                        e["keywords"].setdefault(str(kc), val(kc))
+                e["their_division"] = e["their_division"] or val(divc)
+                e["their_confidence"] = e["their_confidence"] or val(cc)
     return rows
 
 
@@ -172,12 +185,14 @@ def main():
     ap.add_argument("--sheet", help="sheet name (default: all sheets)")
     ap.add_argument("--id-col")
     ap.add_argument("--dir-col")
-    ap.add_argument("--kw-col")
+    ap.add_argument("--kw-col", action="append", help="keyword column (repeatable)")
+    ap.add_argument("--conf-col")
     ap.add_argument("--out", default="output/dir_compare")
     ap.add_argument("--dry-run", action="store_true", help="only show which columns would be used")
     args = ap.parse_args()
 
-    theirs = load_theirs(args.theirs, args.sheet, args.id_col, args.dir_col, args.kw_col, args.dry_run)
+    theirs = load_theirs(args.theirs, args.sheet, args.id_col, args.dir_col, args.kw_col, args.conf_col,
+                         args.dry_run)
     if args.dry_run:
         return
     ours = load_ours([f for f in args.ours if Path(f).is_dir()])
@@ -190,10 +205,11 @@ def main():
         tp = t["their_dirs"][0] if t["their_dirs"] else ""
         rows.append({"id": pid, "title": o["title"], "their_primary": tp,
                      "their_all": "; ".join(t["their_dirs"]), "their_raw": t["their_raw"],
+                     "their_division": t["their_division"], "their_confidence": t["their_confidence"],
                      "our_primary": o["our_primary"], "our_secondary": "; ".join(o["our_secondary"]),
                      "same_primary": tp == o["our_primary"],
                      "overlap": bool(set(t["their_dirs"]) & ({o["our_primary"]} | set(o["our_secondary"]))),
-                     "our_field": o["our_field"], "their_keywords": t["their_keywords"], "our_run": o["our_run"]})
+                     "our_field": o["our_field"], **t["keywords"], "our_run": o["our_run"]})
     df = pd.DataFrame(rows)
     if df.empty:
         sys.exit("no proposals in both; check the ID column (--dry-run) and the --ours folders")
@@ -202,6 +218,17 @@ def main():
     print(f"\n{len(lab)} with a recognizable directorate on their side")
     print(f"same primary:            {lab.same_primary.mean():.0%}   (Cohen's kappa {k:.2f})" if k is not None else "")
     print(f"theirs among ours (primary or secondary): {lab.overlap.mean():.0%}")
+    if lab.their_confidence.ne("").any():
+        c = lab.their_confidence
+        num = pd.to_numeric(c.str.rstrip("%"), errors="coerce")
+        if num.notna().mean() > 0.8 and num.nunique() > 5:  # numeric: split into thirds
+            c = pd.qcut(num, 3, labels=["low third", "middle third", "high third"], duplicates="drop")
+        by = lab.groupby(c.astype(str), observed=True).agg(n=("same_primary", "size"),
+                                                          same_primary=("same_primary", "mean"),
+                                                          overlap=("overlap", "mean"))
+        print("\nagreement by their confidence:")
+        for lv, r in by.iterrows():
+            print(f"  {lv:<14} n={int(r.n):<5} same primary {r.same_primary:.0%}   theirs among ours {r.overlap:.0%}")
     conf = pd.crosstab(lab.their_primary.rename("theirs"), lab.our_primary.rename("ours"),
                        margins=True, margins_name="total")
     print("\ntheir primary (rows) x our primary (columns):")
