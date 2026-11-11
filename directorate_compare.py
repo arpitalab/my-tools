@@ -21,6 +21,14 @@ their primary. Ours: domain.primary_directorate and secondary_directorates from
 the scored .json files; with several --ours folders, the first that has a
 proposal wins (e.g. r08, then r07 for proposals r08 hasn't reached).
 
+--dictionary nsf_directorate_dictionary.csv adds a third, word-matching vote: the
+PI keywords (by default; --dict-on copilot|all) are matched against each
+directorate's dictionary terms, and the directorate with the most matches wins
+(a term listed under k directorates counts 1/k). Among the disagreements it
+reports whether that vote sides with ours or theirs. The dictionary can be long
+(a directorate column and a keyword column, one or several terms per cell) or
+wide (one column per directorate).
+
 Writes to --out: joined.csv (every matched proposal), disagreements.csv, and
 confusion.csv (their primary x our primary). Keep it local: it has titles.
 """
@@ -168,6 +176,49 @@ def load_ours(folders):
     return ours
 
 
+def load_dictionary(path) -> dict[str, set[str]]:
+    df = pd.read_excel(path, dtype=str) if Path(path).suffix.lower() in (".xlsx", ".xls") \
+        else pd.read_csv(path, dtype=str)
+    split = lambda v: [s.strip().lower() for s in re.split(r"[;,|\n]+", str(v)) if s.strip()]
+    terms = {}
+    wide = {c: to_dirs(c) for c in df.columns}
+    if sum(bool(v) for v in wide.values()) >= 3:  # one column per directorate
+        for c, ds in wide.items():
+            if ds:
+                for v in df[c].dropna():
+                    terms.setdefault(ds[0], set()).update(split(v))
+    else:
+        score = lambda c: df[c].dropna().astype(str).map(lambda v: bool(to_dirs(v))).sum()
+        named = [c for c in df.columns if re.search(r"directorate", str(c), re.I)]
+        dc = named[0] if named else max(df.columns, key=score)
+        kws = [c for c in df.columns if re.search(r"keyword|term|word", str(c), re.I) and c != dc] \
+            or [max((c for c in df.columns if c != dc),
+                    key=lambda c: df[c].dropna().astype(str).str.len().mean() or 0)]
+        for _, r in df.iterrows():
+            ds = to_dirs(r[dc])
+            if ds:
+                for kc in kws:
+                    if not pd.isna(r[kc]):
+                        terms.setdefault(ds[0], set()).update(split(r[kc]))
+    print(f"dictionary {Path(path).name}: " + ", ".join(f"{d} {len(v)} terms" for d, v in sorted(terms.items())))
+    return terms
+
+
+def dict_vote(text: str, terms: dict, weight: dict) -> tuple[str, str]:
+    """(winning directorate or '', 'BIO 2.5; GEO 1') from term matches in text."""
+    low = " " + re.sub(r"\s+", " ", text.lower()) + " "
+    score = Counter()
+    for d, ts in terms.items():
+        for term in ts:
+            if len(term) > 2 and re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", low):
+                score[d] += weight[term]
+    if not score:
+        return "", ""
+    top = score.most_common()
+    win = top[0][0] if len(top) == 1 or top[0][1] > top[1][1] else ""  # a tie gives no vote
+    return win, "; ".join(f"{d} {s:.1f}" for d, s in top[:3])
+
+
 def kappa(a, b):
     n = len(a)
     if not n:
@@ -187,6 +238,9 @@ def main():
     ap.add_argument("--dir-col")
     ap.add_argument("--kw-col", action="append", help="keyword column (repeatable)")
     ap.add_argument("--conf-col")
+    ap.add_argument("--dictionary", help="directorate keyword dictionary (.csv/.xlsx) for a third vote")
+    ap.add_argument("--dict-on", choices=("pi", "copilot", "all"), default="pi",
+                    help="which keyword column(s) to match against the dictionary (default: PI keywords)")
     ap.add_argument("--out", default="output/dir_compare")
     ap.add_argument("--dry-run", action="store_true", help="only show which columns would be used")
     args = ap.parse_args()
@@ -213,6 +267,17 @@ def main():
     df = pd.DataFrame(rows)
     if df.empty:
         sys.exit("no proposals in both; check the ID column (--dry-run) and the --ours folders")
+    if args.dictionary:
+        terms = load_dictionary(args.dictionary)
+        n_dirs = Counter(term for ts in terms.values() for term in ts)
+        weight = {term: 1 / n for term, n in n_dirs.items()}
+        kw_cols = [c for c in df.columns if re.search(r"keyword|term|topic", str(c), re.I)]
+        pick = {"pi": [c for c in kw_cols if re.search(r"\bpi\b|investigator|author", str(c), re.I)],
+                "copilot": [c for c in kw_cols if re.search(r"copilot|\bai\b|model|generated", str(c), re.I)],
+                "all": kw_cols}[args.dict_on] or kw_cols
+        print(f"dictionary vote from: {pick}")
+        votes = df[pick].fillna("").astype(str).agg(" ; ".join, axis=1).map(lambda s: dict_vote(s, terms, weight))
+        df["dict_vote"], df["dict_scores"] = votes.str[0], votes.str[1]
     lab = df[df.their_primary != ""]
     k = kappa(list(lab.their_primary), list(lab.our_primary))
     print(f"\n{len(lab)} with a recognizable directorate on their side")
@@ -229,6 +294,17 @@ def main():
         print("\nagreement by their confidence:")
         for lv, r in by.iterrows():
             print(f"  {lv:<14} n={int(r.n):<5} same primary {r.same_primary:.0%}   theirs among ours {r.overlap:.0%}")
+    if "dict_vote" in lab:
+        v = lab[lab.dict_vote != ""]
+        print(f"\ndictionary vote ({len(v)} of {len(lab)} proposals got one): "
+              f"matches ours {(v.dict_vote == v.our_primary).mean():.0%}, "
+              f"matches theirs {(v.dict_vote == v.their_primary).mean():.0%}")
+        dis = v[~v.same_primary]
+        if len(dis):
+            side = Counter("ours" if r.dict_vote == r.our_primary else "theirs" if r.dict_vote == r.their_primary
+                           else "neither" for r in dis.itertuples())
+            print(f"where we disagree ({len(dis)} with a vote): sides with ours {side['ours']}, "
+                  f"theirs {side['theirs']}, neither {side['neither']}")
     conf = pd.crosstab(lab.their_primary.rename("theirs"), lab.our_primary.rename("ours"),
                        margins=True, margins_name="total")
     print("\ntheir primary (rows) x our primary (columns):")
