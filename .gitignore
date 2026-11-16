@@ -15,3 +15,10 @@ nsf_awards.db-wal
 # Secrets
 .env
 *_pwd.py
+
+# rubrics, schemas and notes: never push (public repo)
+_*-rubric.md
+_*-schema.json
+_*-notes.md
+_*-changes.md
+desc-*.txt

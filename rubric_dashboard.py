@@ -49,7 +49,7 @@ PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-16 (final pool, BIO first)"
+DASHBOARD_VERSION = "2026-11-16 (final pool + bio-role)"
 
 
 def newest_results(root="output"):
@@ -87,6 +87,8 @@ def cli_defaults():
     ap.add_argument("--descriptions", default="solr_descriptions/descriptions")
     ap.add_argument("--metadata", default="")
     ap.add_argument("--other-binning", default="", help="another directorate binning (.xlsx/.csv) to show alongside")
+    ap.add_argument("--bio-role", default=None, help="bio-role pass results (all.jsonl); default: newest "
+                    "output/bio_role*/all.jsonl")
     ap.add_argument("--rubric", default=None, help="rubric .md to show (default: matched to the results folder)")
     args, _ = ap.parse_known_args(sys.argv[1:])
     if args.results is None:
@@ -566,6 +568,32 @@ FINAL_CHOICES = [""] + DIRECTORATES + ["Hand off", "Out of scope"]
 DECISION_COLS = ["id", "final_dir", "handoff_to", "note", "decided"]
 
 
+@st.cache_data(show_spinner=False)
+def load_bio_role(path: str, mtime: float) -> pd.DataFrame:
+    """Results of the bio-role pass (_biorole-rNN rubric) -> one row per proposal."""
+    rows = []
+    for line in Path(path).read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        j = lambda v: "; ".join(map(str, v)) if isinstance(v, list) else (v or "")
+        rows.append({
+            "id": Path(str(r.get("file", ""))).stem,
+            "prov_call": _get(r, "provisional_call", "call", default="") or "",
+            "prov_summary": _get(r, "provisional_call", "summary", default="") or "",
+            "bio_role": _get(r, "bio_role", "level", default="") or "",
+            "beneficiary": _get(r, "beneficiary", "primary", default="") or "",
+            "human_clinical": _get(r, "human_clinical", "level", default="") or "",
+            "bio_questions": j(r.get("biological_questions")),
+            "organisms": j(_get(r, "biological_data", "organisms_or_systems")),
+            "role_quotes": j(_get(r, "bio_role", "evidence")),
+        })
+    return pd.DataFrame(rows, columns=["id", "prov_call", "prov_summary", "bio_role", "beneficiary",
+                                       "human_clinical", "bio_questions", "organisms", "role_quotes"]
+                        ).drop_duplicates("id", keep="last")
+
+
 def load_decisions(path: Path) -> pd.DataFrame:
     if path.is_file():
         d = pd.read_csv(path, dtype=str).fillna("")
@@ -585,7 +613,7 @@ def suggested_final(r) -> tuple[str, str]:
     return "", "needs decision"
 
 
-def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: bool):
+def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: bool, bio_role_path: str):
     dec_path = Path(res_path).parent / "final_decisions.csv"
     dec = load_decisions(dec_path)
     d = df.copy()
@@ -604,6 +632,14 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
     d["bio_by"] = d.apply(_bio_by, axis=1)
     d["biomed_flag"] = d["agency_level"].isin(["partial", "strong"]) & \
         d["agencies_txt"].str.contains(BIOMED_RE)
+    br = Path(bio_role_path).expanduser() if bio_role_path else None
+    has_br = bool(br and br.is_file())
+    br_cols = ["prov_call", "prov_summary", "bio_role", "beneficiary", "human_clinical", "bio_questions",
+               "organisms", "role_quotes"]
+    if has_br:
+        d = d.merge(load_bio_role(str(br), br.stat().st_mtime), on="id", how="left")
+    for c in br_cols:
+        d[c] = d[c].fillna("") if c in d.columns else ""
     d = d.merge(dec, on="id", how="left")
     for c in DECISION_COLS[1:]:
         d[c] = d[c].fillna("")
@@ -630,6 +666,14 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
               "Only one binning / no primary": d["binning"].eq(""),
               "Sidebar filter": d["id"].isin(f["id"]),
               "Everything": pd.Series(True, index=d.index)}
+    if has_br:
+        done = d.loc[d["bio"], "prov_call"].ne("")
+        st.caption(f"Bio-role pass: {int(done.sum())} of {int(d['bio'].sum())} BIO proposals have a provisional "
+                   f"call (`{br}`).")
+        queues["BIO, provisional: use case"] = d["bio"] & d["prov_call"].eq("bio_as_use_case")
+        queues["BIO, provisional: biomedical"] = d["bio"] & d["prov_call"].eq("hand_off_biomedical")
+        queues["BIO, provisional: unclear"] = d["bio"] & d["prov_call"].eq("unclear")
+        queues = dict(sorted(queues.items(), key=lambda kv: not kv[0].startswith(("All BIO", "BIO"))))
     if not has_other:
         st.info("No other binning loaded (sidebar), so every proposal uses our primary until you decide.")
     c1, c2 = st.columns([3, 1])
@@ -644,8 +688,11 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
 
     if q.startswith("BIO") or q.startswith("All BIO"):
         st.caption("BIO identified by: " + ", ".join(f"{k} {v}" for k, v in w["bio_by"].value_counts().items()))
-    show_cols = ["id", "title", "bio_by", "ours", "other_all", "suggested", "basis", "final_dir", "handoff_to", "note",
-                 "agency_level", "agencies_txt", "field", "agency_just", "domain_just"]
+    show_cols = ["id", "title", "bio_by", "ours", "other_all", "suggested", "basis", "final_dir", "handoff_to", "note"]
+    if has_br:
+        show_cols += ["prov_call", "bio_role", "beneficiary", "human_clinical", "bio_questions", "organisms",
+                      "prov_summary", "role_quotes"]
+    show_cols += ["agency_level", "agencies_txt", "field", "agency_just", "domain_just"]
     ed_key = f"final_ed_{q}_{undecided_only}"
     ed = st.data_editor(
         w[show_cols].reset_index(drop=True), key=ed_key, hide_index=True,
@@ -659,7 +706,16 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
             "title": st.column_config.TextColumn(width="medium"),
             "agency_just": st.column_config.TextColumn("agency why", width="large"),
             "domain_just": st.column_config.TextColumn("domain why", width="large"),
+            "prov_call": st.column_config.TextColumn("provisional"),
+            "bio_questions": st.column_config.TextColumn("bio questions", width="large"),
+            "prov_summary": st.column_config.TextColumn("provisional why", width="large"),
+            "role_quotes": st.column_config.TextColumn("quotes", width="large"),
         })
+    ids_path = Path(res_path).parent.parent / "bio_ids.txt"
+    if st.button(f"Write the IDs in this list to {ids_path}",
+                 help="For pdf_batch_extract.py --ids (e.g. the bio-role pass)."):
+        ids_path.write_text("\n".join(w["id"]) + "\n")
+        st.success(f"Wrote {len(w)} IDs to `{ids_path}`.")
     if st.button("Save decisions", type="primary"):
         import datetime as _dt
         now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -687,7 +743,7 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
             st.info("Nothing changed.")
 
     st.subheader("Final pool")
-    pool = d[["id", "title", "final", "final_basis", "handoff_to", "ours", "other_all", "note"]].rename(
+    pool = d[["id", "title", "final", "final_basis", "handoff_to", "ours", "other_all", "note", "prov_call"]].rename(
         columns={"final": "final_directorate", "final_basis": "basis", "other_all": "theirs"})
     for c in ("PI", "institution"):
         if c in d.columns:
@@ -725,6 +781,11 @@ def main():
                                         "Copilot exercise). Shown next to ours in Proposals and Domains.")
         if other_path and not Path(other_path).expanduser().is_file():
             st.warning(f"Other binning not found: `{other_path}`")
+        br_found = sorted(Path("output").glob("bio_role*/all.jsonl"), key=lambda p: p.stat().st_mtime) \
+            if Path("output").is_dir() else []
+        bio_role_path = st.text_input("Bio-role pass results (optional)",
+                                      defaults.bio_role or (str(br_found[-1]) if br_found else ""),
+                                      help="all.jsonl from the _biorole rubric run; shown in the Final pool tab.")
         ffrdc_path = st.text_input("FFRDC list", str(Path(__file__).parent / "ffrdc_list.csv"))
         others = [str(p) for p in Path("output").rglob("all.jsonl")] if Path("output").is_dir() else []
         if len(others) > 1:
@@ -1251,7 +1312,7 @@ def main():
 
     # ---- Final pool ------------------------------------------------------- #
     with tabs[6]:
-        final_pool_tab(df, f, res_path, has_other)
+        final_pool_tab(df, f, res_path, has_other, bio_role_path)
 
     # ---- Rubric ----------------------------------------------------------- #
     with tabs[7]:
