@@ -49,7 +49,7 @@ PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-16 (final pool + bio-role)"
+DASHBOARD_VERSION = "2026-11-16b (final pool + bio-role)"
 
 
 def newest_results(root="output"):
@@ -638,7 +638,19 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
     br_cols = ["prov_call", "prov_summary", "bio_role", "beneficiary", "bio_theme", "human_clinical", "bio_questions",
                "organisms", "role_quotes"]
     if has_br:
-        d = d.merge(load_bio_role(str(br), br.stat().st_mtime), on="id", how="left")
+        brd = load_bio_role(str(br), br.stat().st_mtime)
+        d = d.merge(brd, on="id", how="left")
+        hit = d["prov_call"].notna().sum()
+        if len(brd) and not hit:
+            st.warning(f"`{br}` has {len(brd)} results but none match the proposals here (its IDs look like "
+                       f"{', '.join(brd['id'].head(3))}; ours like {', '.join(d['id'].head(3))}).")
+        elif not len(brd):
+            st.warning(f"`{br}` has no results yet (it's refreshed every 5 proposals).")
+    elif bio_role_path:
+        st.warning(f"Bio-role results not found: `{bio_role_path}` (relative paths are from `{Path.cwd()}`).")
+    else:
+        st.caption("No bio-role results loaded. Put `output/bio_role_r02/all.jsonl` in the sidebar field "
+                   "'Bio-role pass results'.")
     for c in br_cols:
         d[c] = d[c].fillna("") if c in d.columns else ""
     d = d.merge(dec, on="id", how="left")
@@ -668,9 +680,9 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
               "Sidebar filter": d["id"].isin(f["id"]),
               "Everything": pd.Series(True, index=d.index)}
     if has_br:
-        done = d.loc[d["bio"], "prov_call"].ne("")
-        st.caption(f"Bio-role pass: {int(done.sum())} of {int(d['bio'].sum())} BIO proposals have a provisional "
-                   f"call (`{br}`).")
+        done = d["prov_call"].ne("")
+        st.caption(f"Bio-role pass: {int(done.sum())} proposals have a provisional call "
+                   f"({int((done & d['bio']).sum())} of {int(d['bio'].sum())} BIO) from `{br}`.")
         queues["BIO, provisional: use case"] = d["bio"] & d["prov_call"].eq("bio_as_use_case")
         queues["BIO, provisional: biomedical"] = d["bio"] & d["prov_call"].eq("hand_off_biomedical")
         queues["BIO, provisional: unclear"] = d["bio"] & d["prov_call"].eq("unclear")
