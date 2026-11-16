@@ -49,7 +49,7 @@ PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-11 (other binning)"
+DASHBOARD_VERSION = "2026-11-16 (final pool)"
 
 
 def newest_results(root="output"):
@@ -561,6 +561,137 @@ def show(fig):
 # --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
+BIOMED_RE = re.compile(r"(?i)\b(?:NIH|HHS|NCI|NIGMS|NHGRI|NLM|NIBIB|NIMH|NIA|NIAID|CDC|FDA|ARPA-H|AHRQ|VA)\b")
+FINAL_CHOICES = [""] + DIRECTORATES + ["Hand off", "Out of scope"]
+DECISION_COLS = ["id", "final_dir", "handoff_to", "note", "decided"]
+
+
+def load_decisions(path: Path) -> pd.DataFrame:
+    if path.is_file():
+        d = pd.read_csv(path, dtype=str).fillna("")
+        return d.reindex(columns=DECISION_COLS, fill_value="").drop_duplicates("id", keep="last")
+    return pd.DataFrame(columns=DECISION_COLS)
+
+
+def suggested_final(r) -> tuple[str, str]:
+    """(directorate, basis) before any manual decision."""
+    ours, theirs = r.get("primary_dir") or "", r.get("other_dir") or ""
+    if ours and ours == theirs:
+        return ours, "agreed"
+    if ours and not theirs:
+        return ours, "ours only"
+    if theirs and not ours:
+        return theirs, "theirs only"
+    return "", "needs decision"
+
+
+def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: bool):
+    dec_path = Path(res_path).parent / "final_decisions.csv"
+    dec = load_decisions(dec_path)
+    d = df.copy()
+    if "other_dir" not in d.columns:
+        d["other_dir"], d["other_all"], d["binning"] = "", "", ""
+    sug = d.apply(suggested_final, axis=1)
+    d["suggested"], d["basis"] = sug.map(lambda t: t[0]), sug.map(lambda t: t[1])
+    d["ours"] = d.apply(lambda r: " + ".join([r["primary_dir"] or "?"] + list(r["secondary_dirs"])), axis=1)
+    d["agencies_txt"] = d["agencies"].map(lambda a: ", ".join(a) if isinstance(a, list) else "")
+    d["bio"] = (d["primary_dir"] == "BIO") | d["secondary_dirs"].map(lambda l: "BIO" in l) | \
+               (d["other_dir"] == "BIO")
+    d["biomed_flag"] = d["agency_level"].isin(["partial", "strong"]) & \
+        d["agencies_txt"].str.contains(BIOMED_RE)
+    d = d.merge(dec, on="id", how="left")
+    for c in DECISION_COLS[1:]:
+        d[c] = d[c].fillna("")
+    d["final"] = d["final_dir"].where(d["final_dir"] != "", d["suggested"])
+    d["final_basis"] = d["basis"].where(d["final_dir"] == "", "decided")
+
+    st.markdown(
+        "Settle each proposal's directorate and mark the ones to hand to another agency. Where the two "
+        "binnings agree (or only one exists) that answer is used unless you override it. Decisions are "
+        f"saved to `{dec_path}` (local; contains no text beyond your notes).")
+    n_dec = (d["final_dir"] != "").sum()
+    open_ = d["final"].eq("")
+    k = st.columns(4)
+    k[0].metric("Decided by you", int(n_dec))
+    k[1].metric("Still open", int(open_.sum()))
+    k[2].metric("Biomedical candidates", int((d["bio"] & d["biomed_flag"]).sum()))
+    k[3].metric("Marked hand off", int((d["final"] == "Hand off").sum()))
+
+    queues = {"Mismatches (theirs ≠ ours)": d["binning"].isin(["theirs among ours", "no overlap"]),
+              "Only one binning / no primary": d["binning"].eq(""),
+              "BIO, flagged for NIH/HHS-type agency": d["bio"] & d["biomed_flag"],
+              "All BIO (ours or theirs)": d["bio"],
+              "Sidebar filter": d["id"].isin(f["id"]),
+              "Everything": pd.Series(True, index=d.index)}
+    if not has_other:
+        st.info("No other binning loaded (sidebar), so every proposal uses our primary until you decide.")
+    c1, c2 = st.columns([3, 1])
+    q = c1.radio("Worklist", list(queues), horizontal=True)
+    undecided_only = c2.checkbox("Hide ones I've decided", value=False)
+    w = d[queues[q]]
+    if undecided_only:
+        w = w[w["final_dir"] == ""]
+    st.caption(f"{len(w)} proposals in this list. 'final_dir' blank = keep the suggestion. Pick "
+               "'Hand off' and fill 'handoff_to' (e.g. NIH) for proposals to give away. Save before "
+               "switching lists; unsaved edits are dropped.")
+
+    show_cols = ["id", "title", "ours", "other_all", "suggested", "basis", "final_dir", "handoff_to", "note",
+                 "agency_level", "agencies_txt", "field", "agency_just", "domain_just"]
+    ed_key = f"final_ed_{q}_{undecided_only}"
+    ed = st.data_editor(
+        w[show_cols].reset_index(drop=True), key=ed_key, hide_index=True,
+        use_container_width=True, height=min(600, 38 * (len(w) + 1)),
+        disabled=[c for c in show_cols if c not in ("final_dir", "handoff_to", "note")],
+        column_config={
+            "final_dir": st.column_config.SelectboxColumn("final_dir", options=FINAL_CHOICES),
+            "other_all": st.column_config.TextColumn("theirs"),
+            "agencies_txt": st.column_config.TextColumn("agencies"),
+            "title": st.column_config.TextColumn(width="medium"),
+            "agency_just": st.column_config.TextColumn("agency why", width="large"),
+            "domain_just": st.column_config.TextColumn("domain why", width="large"),
+        })
+    if st.button("Save decisions", type="primary"):
+        import datetime as _dt
+        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        new = ed[["id", "final_dir", "handoff_to", "note"]].fillna("")
+        old = dec.set_index("id")
+        changed = []
+        for _, r in new.iterrows():
+            prev = old.loc[r["id"]] if r["id"] in old.index else None
+            vals = (r["final_dir"], r["handoff_to"], r["note"])
+            if prev is None and not any(vals):
+                continue
+            if prev is not None and tuple(prev[["final_dir", "handoff_to", "note"]]) == vals:
+                continue
+            changed.append({**r.to_dict(), "decided": now})
+        if changed:
+            out = pd.concat([dec, pd.DataFrame(changed)], ignore_index=True)
+            out = out.drop_duplicates("id", keep="last")
+            out = out[(out[["final_dir", "handoff_to", "note"]] != "").any(axis=1)]
+            dec_path.parent.mkdir(parents=True, exist_ok=True)
+            out.to_csv(dec_path, index=False)
+            # the editor keeps edits by row position; drop them so they can't land on other rows
+            st.session_state.pop(ed_key, None)
+            st.rerun()
+        else:
+            st.info("Nothing changed.")
+
+    st.subheader("Final pool")
+    pool = d[["id", "title", "final", "final_basis", "handoff_to", "ours", "other_all", "note"]].rename(
+        columns={"final": "final_directorate", "final_basis": "basis", "other_all": "theirs"})
+    for c in ("PI", "institution"):
+        if c in d.columns:
+            pool.insert(2, c, d[c].fillna(""))
+    summ = pd.crosstab(pool["final_directorate"].replace("", "(open)"), pool["basis"], margins=True,
+                       margins_name="total")
+    st.dataframe(summ, use_container_width=True)
+    c1, c2 = st.columns(2)
+    c1.download_button("Download final pool (CSV)", pool.to_csv(index=False), "final_pool.csv", "text/csv")
+    if c2.button("Write final_pool.csv next to the results"):
+        pool.to_csv(Path(res_path).parent / "final_pool.csv", index=False)
+        st.success(f"Wrote `{Path(res_path).parent / 'final_pool.csv'}`.")
+
+
 def main():
     st.set_page_config(page_title="Proposal Rubric Dashboard", layout="wide")
     defaults = cli_defaults()
@@ -785,7 +916,7 @@ def main():
         k[5].metric("Interdisciplinary", f"{f['interdisciplinary'].sum()}",
                     f"{f['interdisciplinary'].sum() / n:.0%}", delta_color="off")
 
-    tabs = st.tabs(["Overview", "Domains", "Flags", "Planning", "Proposals", "QA", "Rubric"])
+    tabs = st.tabs(["Overview", "Domains", "Flags", "Planning", "Proposals", "QA", "Final pool", "Rubric"])
 
     # ---- Overview --------------------------------------------------------- #
     with tabs[0]:
@@ -1108,8 +1239,12 @@ def main():
         else:
             st.success("No issues found.")
 
-    # ---- Rubric ----------------------------------------------------------- #
+    # ---- Final pool ------------------------------------------------------- #
     with tabs[6]:
+        final_pool_tab(df, f, res_path, has_other)
+
+    # ---- Rubric ----------------------------------------------------------- #
+    with tabs[7]:
         rp = Path(rubric_path).expanduser() if rubric_path else None
         if not rp or not rp.is_file():
             st.info("No rubric file found. Put its path in the sidebar (e.g. "
