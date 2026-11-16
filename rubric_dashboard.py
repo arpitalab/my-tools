@@ -584,12 +584,13 @@ def load_bio_role(path: str, mtime: float) -> pd.DataFrame:
             "prov_summary": _get(r, "provisional_call", "summary", default="") or "",
             "bio_role": _get(r, "bio_role", "level", default="") or "",
             "beneficiary": _get(r, "beneficiary", "primary", default="") or "",
+            "bio_theme": _get(r, "bio_theme", "theme", default="") or "",
             "human_clinical": _get(r, "human_clinical", "level", default="") or "",
             "bio_questions": j(r.get("biological_questions")),
             "organisms": j(_get(r, "biological_data", "organisms_or_systems")),
             "role_quotes": j(_get(r, "bio_role", "evidence")),
         })
-    return pd.DataFrame(rows, columns=["id", "prov_call", "prov_summary", "bio_role", "beneficiary",
+    return pd.DataFrame(rows, columns=["id", "prov_call", "prov_summary", "bio_role", "beneficiary", "bio_theme",
                                        "human_clinical", "bio_questions", "organisms", "role_quotes"]
                         ).drop_duplicates("id", keep="last")
 
@@ -634,7 +635,7 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
         d["agencies_txt"].str.contains(BIOMED_RE)
     br = Path(bio_role_path).expanduser() if bio_role_path else None
     has_br = bool(br and br.is_file())
-    br_cols = ["prov_call", "prov_summary", "bio_role", "beneficiary", "human_clinical", "bio_questions",
+    br_cols = ["prov_call", "prov_summary", "bio_role", "beneficiary", "bio_theme", "human_clinical", "bio_questions",
                "organisms", "role_quotes"]
     if has_br:
         d = d.merge(load_bio_role(str(br), br.stat().st_mtime), on="id", how="left")
@@ -690,7 +691,7 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
         st.caption("BIO identified by: " + ", ".join(f"{k} {v}" for k, v in w["bio_by"].value_counts().items()))
     show_cols = ["id", "title", "bio_by", "ours", "other_all", "suggested", "basis", "final_dir", "handoff_to", "note"]
     if has_br:
-        show_cols += ["prov_call", "bio_role", "beneficiary", "human_clinical", "bio_questions", "organisms",
+        show_cols += ["prov_call", "bio_role", "bio_theme", "beneficiary", "human_clinical", "bio_questions", "organisms",
                       "prov_summary", "role_quotes"]
     show_cols += ["agency_level", "agencies_txt", "field", "agency_just", "domain_just"]
     ed_key = f"final_ed_{q}_{undecided_only}"
