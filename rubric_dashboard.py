@@ -49,7 +49,7 @@ PLAN_PREFIX_EXACT = re.compile(r"^Planning: AIDatasets: ")    # required form
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-DASHBOARD_VERSION = "2026-11-16 (final pool)"
+DASHBOARD_VERSION = "2026-11-16 (final pool, BIO first)"
 
 
 def newest_results(root="output"):
@@ -597,6 +597,11 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
     d["agencies_txt"] = d["agencies"].map(lambda a: ", ".join(a) if isinstance(a, list) else "")
     d["bio"] = (d["primary_dir"] == "BIO") | d["secondary_dirs"].map(lambda l: "BIO" in l) | \
                (d["other_dir"] == "BIO")
+    def _bio_by(r):
+        us = "ours" if r["primary_dir"] == "BIO" else ("our secondary" if "BIO" in r["secondary_dirs"] else "")
+        them = r["other_dir"] == "BIO"
+        return "both" if us == "ours" and them else (us + " + theirs" if us and them else (us or ("theirs" if them else "")))
+    d["bio_by"] = d.apply(_bio_by, axis=1)
     d["biomed_flag"] = d["agency_level"].isin(["partial", "strong"]) & \
         d["agencies_txt"].str.contains(BIOMED_RE)
     d = d.merge(dec, on="id", how="left")
@@ -614,13 +619,15 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
     k = st.columns(4)
     k[0].metric("Decided by you", int(n_dec))
     k[1].metric("Still open", int(open_.sum()))
-    k[2].metric("Biomedical candidates", int((d["bio"] & d["biomed_flag"]).sum()))
+    k[2].metric("BIO (ours or theirs)", int(d["bio"].sum()),
+                f"{int((d['bio'] & d['biomed_flag']).sum())} flagged NIH/HHS-type", delta_color="off")
     k[3].metric("Marked hand off", int((d["final"] == "Hand off").sum()))
 
-    queues = {"Mismatches (theirs ≠ ours)": d["binning"].isin(["theirs among ours", "no overlap"]),
-              "Only one binning / no primary": d["binning"].eq(""),
+    queues = {"All BIO (ours or theirs)": d["bio"],
               "BIO, flagged for NIH/HHS-type agency": d["bio"] & d["biomed_flag"],
-              "All BIO (ours or theirs)": d["bio"],
+              "BIO, binnings disagree": d["bio"] & (d["bio_by"] != "both"),
+              "Mismatches (theirs ≠ ours)": d["binning"].isin(["theirs among ours", "no overlap"]),
+              "Only one binning / no primary": d["binning"].eq(""),
               "Sidebar filter": d["id"].isin(f["id"]),
               "Everything": pd.Series(True, index=d.index)}
     if not has_other:
@@ -635,7 +642,9 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
                "'Hand off' and fill 'handoff_to' (e.g. NIH) for proposals to give away. Save before "
                "switching lists; unsaved edits are dropped.")
 
-    show_cols = ["id", "title", "ours", "other_all", "suggested", "basis", "final_dir", "handoff_to", "note",
+    if q.startswith("BIO") or q.startswith("All BIO"):
+        st.caption("BIO identified by: " + ", ".join(f"{k} {v}" for k, v in w["bio_by"].value_counts().items()))
+    show_cols = ["id", "title", "bio_by", "ours", "other_all", "suggested", "basis", "final_dir", "handoff_to", "note",
                  "agency_level", "agencies_txt", "field", "agency_just", "domain_just"]
     ed_key = f"final_ed_{q}_{undecided_only}"
     ed = st.data_editor(
@@ -646,6 +655,7 @@ def final_pool_tab(df: pd.DataFrame, f: pd.DataFrame, res_path: str, has_other: 
             "final_dir": st.column_config.SelectboxColumn("final_dir", options=FINAL_CHOICES),
             "other_all": st.column_config.TextColumn("theirs"),
             "agencies_txt": st.column_config.TextColumn("agencies"),
+            "bio_by": st.column_config.TextColumn("BIO by"),
             "title": st.column_config.TextColumn(width="medium"),
             "agency_just": st.column_config.TextColumn("agency why", width="large"),
             "domain_just": st.column_config.TextColumn("domain why", width="large"),
