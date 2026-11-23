@@ -31,7 +31,7 @@ PLAN_PREFIX_RE = re.compile(r"^\s*planning\s*:", re.I)
 # words that suggest human subjects; the bio-role rubric should catch these but doesn't always
 HUMAN_RE = re.compile(r"(?i)\b(human|humans|child|children|infant|infants|patient|patients|clinical|"
                       r"speech|language acquisition|participants|cohort|hospital|medical)\b")
-APP_VERSION = "2026-11-23b (autosave)"
+APP_VERSION = "2026-11-23c (autosave, view stays put)"
 
 
 def cli():
@@ -165,7 +165,7 @@ def write_flags(path: Path, flags: pd.DataFrame):
     tmp.replace(path)
 
 
-def autosave(key: str, ids: list, rec: dict, path: Path, bump: bool):
+def autosave(key: str, ids: list, rec: dict, path: Path):
     """on_change of a table: write its edits to bio_flags.csv straight away.
     Streamlit keeps a table's edits as {row position: {column: value}}; `ids` maps
     positions back to proposal IDs for the rows that table showed."""
@@ -186,8 +186,6 @@ def autosave(key: str, ids: list, rec: dict, path: Path, bump: bool):
     cur = cur[(cur["my_flag"] != "") | (cur["comment"] != "")]
     write_flags(path, cur.reset_index())
     st.session_state["_last_save"] = f"{now[-8:]} ({len(cur)} proposals with a flag override or comment)"
-    if bump:  # rows may move in or out of a filtered view; start the table fresh from the saved file
-        st.session_state["_ver"] = st.session_state.get("_ver", 0) + 1
 
 
 SHOW = ["flag", "recommended", "why", "comment", "id", "title", "PI", "institution", "final_directorate",
@@ -270,8 +268,15 @@ def main():
 
     tracks = [t for t in ("Planning", "Impact/Flagship", "Unclear") if (d["track"] == t).any()]
     tabs = st.tabs(tracks + ["Summary"])
-    filt_key = f"{sorted(show_flag)}_{only_over}_{q}_{everything}_{st.session_state.get('_ver', 0)}"
-    filtered = bool(show_flag or only_over or q)
+    # Each table is drawn from a copy of its rows frozen when the view was opened, so
+    # an autosave doesn't change the table's data (which would redraw it and jump back
+    # to the top). Changing a filter opens a new view built from the saved file; the
+    # old views are dropped so their stale edits can't be written again.
+    filt_key = f"{sorted(show_flag)}_{only_over}_{q}_{everything}_{flags_path}"
+    if st.session_state.get("_view") != filt_key:
+        for k in [k for k in st.session_state if str(k).startswith(("ed_", "base_"))]:
+            del st.session_state[k]
+        st.session_state["_view"] = filt_key
     rec_map = d.set_index("id")["recommended"].to_dict()
     for t, tab in zip(tracks, tabs):
         with tab:
@@ -283,12 +288,16 @@ def main():
                             int((all_t["flag"] == fl).sum()))
             k[3].metric("Overridden by you", int((all_t["my_flag"].isin(FLAGS) &
                                                  (all_t["my_flag"] != all_t["recommended"])).sum()))
-            st.caption(f"{len(w)} of {len(all_t)} {t} proposals shown.")
-            key = f"ed_{t}_{filt_key}"
+            st.caption(f"{len(w)} of {len(all_t)} {t} proposals match the filters. Rows stay put while you "
+                       "edit; change a filter (or reload the page) to re-sort and re-filter.")
+            key = f"ed_{t}"
+            if "base_" + key not in st.session_state:
+                st.session_state["base_" + key] = w[SHOW].reset_index(drop=True)
+            base = st.session_state["base_" + key]
             st.data_editor(
-                w[SHOW].reset_index(drop=True), key=key, hide_index=True, use_container_width=True,
-                on_change=autosave, args=(key, w["id"].tolist(), rec_map, flags_path, filtered),
-                height=min(700, 38 * (len(w) + 1)),
+                base, key=key, hide_index=True, use_container_width=True,
+                on_change=autosave, args=(key, base["id"].tolist(), rec_map, flags_path),
+                height=min(700, 38 * (len(base) + 1)),
                 disabled=[c for c in SHOW if c not in ("flag", "comment")],
                 column_config={
                     "flag": st.column_config.SelectboxColumn("flag", options=FLAGS, required=True, width="small",
