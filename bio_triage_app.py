@@ -10,8 +10,8 @@ Impact/Flagship proposals are on separate tabs.
     streamlit run bio_triage_app.py -- --pool output/ai_datasets_r08/final_pool.csv \
         --results output/ai_datasets_r08/all.jsonl --bio-role output/bio_role_r02/all.jsonl
 
-Your flags and comments go to bio_flags.csv next to final_pool.csv (local; only
-overrides and comments are stored, so the rest follow the recommendation). Export
+Every edit is saved straight away to bio_flags.csv next to final_pool.csv (local;
+only overrides and comments are stored, so the rest follow the recommendation). Export
 gives every row with its final flag, as CSV or Excel with one sheet per track.
 """
 
@@ -31,7 +31,7 @@ PLAN_PREFIX_RE = re.compile(r"^\s*planning\s*:", re.I)
 # words that suggest human subjects; the bio-role rubric should catch these but doesn't always
 HUMAN_RE = re.compile(r"(?i)\b(human|humans|child|children|infant|infants|patient|patients|clinical|"
                       r"speech|language acquisition|participants|cohort|hospital|medical)\b")
-APP_VERSION = "2026-11-23"
+APP_VERSION = "2026-11-23b (autosave)"
 
 
 def cli():
@@ -154,6 +154,42 @@ def load_flags(path: Path) -> pd.DataFrame:
     return pd.DataFrame(columns=["id", "my_flag", "comment", "saved"])
 
 
+def write_flags(path: Path, flags: pd.DataFrame):
+    """Atomic write, plus a backup of the previous file once per session."""
+    if path.is_file() and not st.session_state.get("_backed_up"):
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        (path.parent / f"bio_flags.backup-{stamp}.csv").write_bytes(path.read_bytes())
+        st.session_state["_backed_up"] = True
+    tmp = path.with_suffix(".tmp")
+    flags.to_csv(tmp, index=False)
+    tmp.replace(path)
+
+
+def autosave(key: str, ids: list, rec: dict, path: Path, bump: bool):
+    """on_change of a table: write its edits to bio_flags.csv straight away.
+    Streamlit keeps a table's edits as {row position: {column: value}}; `ids` maps
+    positions back to proposal IDs for the rows that table showed."""
+    edits = (st.session_state.get(key) or {}).get("edited_rows", {})
+    cur = load_flags(path).set_index("id")
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n = 0
+    for pos, ch in edits.items():
+        pid = ids[int(pos)]
+        mine, com = (cur.loc[pid, "my_flag"], cur.loc[pid, "comment"]) if pid in cur.index else ("", "")
+        if "flag" in ch:
+            mine = "" if (ch["flag"] or rec[pid]) == rec[pid] else ch["flag"]
+        if "comment" in ch:
+            com = ch["comment"] or ""
+        cur.loc[pid, ["my_flag", "comment", "saved"]] = [mine, com, now]
+        n += 1
+    cur = cur.fillna("")
+    cur = cur[(cur["my_flag"] != "") | (cur["comment"] != "")]
+    write_flags(path, cur.reset_index())
+    st.session_state["_last_save"] = f"{now[-8:]} ({len(cur)} proposals with a flag override or comment)"
+    if bump:  # rows may move in or out of a filtered view; start the table fresh from the saved file
+        st.session_state["_ver"] = st.session_state.get("_ver", 0) + 1
+
+
 SHOW = ["flag", "recommended", "why", "comment", "id", "title", "PI", "institution", "final_directorate",
         "basis", "ours", "theirs", "prov_call", "bio_role", "bio_theme", "beneficiary", "human_clinical",
         "overall", "organisms", "bio_questions", "prov_summary", "note", "field"]
@@ -215,7 +251,8 @@ def main():
 
     st.title("BIO triage")
     st.caption(f"{FLAG_HELP}. `flag` starts at the recommendation; change it where you disagree and add a "
-               f"comment if useful, then **Save** (sidebar). Saved to `{flags_path}`.")
+               f"comment if useful. **Every edit is saved as soon as you leave the cell** (Enter, Tab or "
+               f"click elsewhere) to `{flags_path}`.")
     with st.sidebar:
         st.header("Filter")
         show_flag = st.multiselect("Current flag", FLAGS)
@@ -233,8 +270,9 @@ def main():
 
     tracks = [t for t in ("Planning", "Impact/Flagship", "Unclear") if (d["track"] == t).any()]
     tabs = st.tabs(tracks + ["Summary"])
-    edited = []
-    filt_key = f"{sorted(show_flag)}_{only_over}_{q}_{everything}"
+    filt_key = f"{sorted(show_flag)}_{only_over}_{q}_{everything}_{st.session_state.get('_ver', 0)}"
+    filtered = bool(show_flag or only_over or q)
+    rec_map = d.set_index("id")["recommended"].to_dict()
     for t, tab in zip(tracks, tabs):
         with tab:
             w = f[f["track"] == t]
@@ -247,8 +285,9 @@ def main():
                                                  (all_t["my_flag"] != all_t["recommended"])).sum()))
             st.caption(f"{len(w)} of {len(all_t)} {t} proposals shown.")
             key = f"ed_{t}_{filt_key}"
-            ed = st.data_editor(
+            st.data_editor(
                 w[SHOW].reset_index(drop=True), key=key, hide_index=True, use_container_width=True,
+                on_change=autosave, args=(key, w["id"].tolist(), rec_map, flags_path, filtered),
                 height=min(700, 38 * (len(w) + 1)),
                 disabled=[c for c in SHOW if c not in ("flag", "comment")],
                 column_config={
@@ -264,7 +303,6 @@ def main():
                     "bio_questions": st.column_config.TextColumn("bio questions", width="large"),
                     "prov_summary": st.column_config.TextColumn("provisional why", width="large"),
                 })
-            edited.append((key, ed))
     with tabs[-1]:
         st.subheader("Flags by track")
         st.dataframe(pd.crosstab(d["track"], d["flag"], margins=True, margins_name="total"),
@@ -278,29 +316,13 @@ def main():
                      hide_index=True, use_container_width=True)
 
     with st.sidebar:
-        st.header("Save and export")
-        if st.button("Save flags", type="primary"):
-            now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-            rec_by_id = d.set_index("id")["recommended"]
-            old = saved.set_index("id")
-            changed = []
-            for _, ed in edited:
-                for _, r in ed.iterrows():
-                    mine = r["flag"] if r["flag"] != rec_by_id.get(r["id"]) else ""
-                    com = r["comment"] or ""
-                    prev = (old.loc[r["id"], "my_flag"], old.loc[r["id"], "comment"]) if r["id"] in old.index \
-                        else ("", "")
-                    if (mine, com) != tuple(prev):
-                        changed.append({"id": r["id"], "my_flag": mine, "comment": com, "saved": now})
-            if changed:
-                out = pd.concat([saved, pd.DataFrame(changed)], ignore_index=True).drop_duplicates("id", keep="last")
-                out = out[(out["my_flag"] != "") | (out["comment"] != "")]
-                out.to_csv(flags_path, index=False)
-                for key, _ in edited:  # editor edits are kept by row position; drop them after saving
-                    st.session_state.pop(key, None)
-                st.rerun()
-            st.info("Nothing changed.")
-        st.caption("Save before changing filters; unsaved edits in the table are dropped.")
+        st.header("Saving and export")
+        if st.session_state.get("_last_save"):
+            st.success("Saved " + st.session_state["_last_save"])
+        else:
+            st.caption(f"Edits save automatically. {len(saved)} overrides/comments on file.")
+        st.caption("A backup of the previous bio_flags.csv is kept once per session "
+                   "(bio_flags.backup-<time>.csv).")
         export = d[["track", "flag", "recommended", "why", "comment"] +
                    [c for c in SHOW if c not in ("flag", "recommended", "why", "comment")]]
         st.download_button("Download all (CSV)", export.to_csv(index=False), "bio_triage.csv", "text/csv")
