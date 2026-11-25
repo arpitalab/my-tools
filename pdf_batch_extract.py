@@ -469,7 +469,9 @@ def main():
     ap.add_argument("--chunk-chars", type=int, default=60000,
                     help="PDFs longer than this are summarized in chunks first (~4 chars/token)")
     ap.add_argument("--retries", type=int, default=2)
-    ap.add_argument("--think", action="store_true", help="enable model thinking (off by default)")
+    ap.add_argument("--think", nargs="?", const="on", default=None, metavar="LEVEL",
+                    help="enable model thinking (off by default). Optionally a level: low, medium or "
+                         "high. gpt-oss can't turn thinking off, so give it a level, e.g. --think low")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="sampling temperature (default 0 = repeatable; e.g. 0.7 for a noise check)")
     ap.add_argument("--seed", type=int, default=None, help="sampling seed (with --temperature > 0)")
@@ -483,7 +485,17 @@ def main():
                     help="stop the run after this many failures in a row (Ollama down?)")
     args = ap.parse_args()
     global THINK, WORKERS, TEMPERATURE, SEED, NUM_BATCH, OLLAMA_URL
-    THINK = args.think
+    if args.think is None:
+        THINK = False
+    elif args.think == "on":
+        THINK = True
+    elif args.think in ("low", "medium", "high"):
+        THINK = args.think
+    else:
+        ap.error(f"--think takes low, medium or high (or nothing), not {args.think!r}")
+    if "gpt-oss" in args.model and THINK is False:
+        warn("note: gpt-oss can't turn thinking off (it would think at its default, medium); "
+             "use --think low for the shortest reasoning")
     TEMPERATURE, SEED = args.temperature, args.seed
     WORKERS = max(1, args.workers)
     NUM_BATCH = args.num_batch
